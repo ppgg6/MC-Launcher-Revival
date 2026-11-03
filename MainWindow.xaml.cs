@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows;
@@ -15,6 +16,14 @@ public partial class MainWindow : Window
 {
     private const string ManifestUrl = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(5) };
+    // Java 下载使用独立连接池，避免与游戏资源下载互相争抢连接。
+    private static readonly HttpClient JavaHttp = new(new SocketsHttpHandler
+    {
+        AutomaticDecompression = System.Net.DecompressionMethods.None,
+        MaxConnectionsPerServer = 8,
+        PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+        ConnectTimeout = TimeSpan.FromSeconds(30)
+    }) { Timeout = Timeout.InfiniteTimeSpan };
     private static readonly SemaphoreSlim DownloadSlots = new(8, 8);
     private int _assetDone;
     private List<VersionRow> _versions = new();
@@ -114,21 +123,7 @@ public partial class MainWindow : Window
         Log($"开始下载 Eclipse Temurin Java {major}。安装目录：{installDir}");
         string api = $"https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jre/hotspot/normal/eclipse";
         string archive = Path.Combine(javaRoot, $"temurin-{major}.zip");
-        Exception? lastDownloadError = null;
-        for (int attempt = 1; attempt <= 3; attempt++)
-        {
-            try
-            {
-                using var response = await Http.GetAsync(api, HttpCompletionOption.ResponseHeadersRead);
-                response.EnsureSuccessStatusCode();
-                await using var input = await response.Content.ReadAsStreamAsync();
-                await using var output = new FileStream(archive, FileMode.Create, FileAccess.Write, FileShare.None, 131072, true);
-                await input.CopyToAsync(output);
-                lastDownloadError = null; break;
-            }
-            catch (Exception ex) { lastDownloadError = ex; if (attempt < 3) await Task.Delay(1200 * attempt); }
-        }
-        if (lastDownloadError != null) throw new Exception($"Java {major} 下载连续失败 3 次。", lastDownloadError);
+        await DownloadJavaArchiveAsync(api, archive, major);
         if (!File.Exists(archive) || new FileInfo(archive).Length < 1024 * 1024) throw new InvalidDataException("Java 下载包大小异常，已拒绝解压。");
         SetStatus($"Java {major} 下载完成，正在解压……");
         if (Directory.Exists(installDir)) Directory.Delete(installDir, true);
@@ -146,6 +141,194 @@ public partial class MainWindow : Window
         SetStatus($"Java {major} 安装完成并通过版本校验：" + javaExe);
         Log($"Java {major} 安装完成：" + javaExe);
         return javaExe;
+    }
+
+    private async Task DownloadJavaArchiveAsync(string url, string archive, int major)
+    {
+        string partial = archive + ".part";
+        Exception? lastError = null;
+        const int maxAttempts = 5;
+        const int bufferSize = 1024 * 1024; // 1 MiB 缓冲，减少小块 I/O 开销
+        // 下载服务器支持 HTTP Range 时，尝试 4 路分段并发；不支持则自动回退到续传单流。
+        if (await TryDownloadJavaInParallelAsync(url, partial, major))
+        {
+            File.Move(partial, archive, true);
+            Log($"Java {major} 多线程下载完成，文件大小：{new FileInfo(archive).Length / 1048576d:F1} MB。");
+            return;
+        }
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                long offset = File.Exists(partial) ? new FileInfo(partial).Length : 0;
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                if (offset > 0) request.Headers.Range = new RangeHeaderValue(offset, null);
+                using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+                using var response = await JavaHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+                // 只有服务器明确返回 206 才能追加；若忽略 Range 返回 200，就安全地从头覆盖。
+                bool append = offset > 0 && response.StatusCode == System.Net.HttpStatusCode.PartialContent;
+                if (offset > 0 && !append) offset = 0;
+                response.EnsureSuccessStatusCode();
+                long? totalBytes = response.Content.Headers.ContentRange?.Length;
+                if (!totalBytes.HasValue && response.Content.Headers.ContentLength.HasValue)
+                    totalBytes = response.Content.Headers.ContentLength.Value + offset;
+
+                await using var input = await response.Content.ReadAsStreamAsync(timeout.Token);
+                await using var output = new FileStream(partial,
+                    append ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None,
+                    bufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                byte[] buffer = new byte[bufferSize];
+                long received = offset;
+                var clock = Stopwatch.StartNew();
+                long lastReport = 0;
+                while (true)
+                {
+                    int read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), timeout.Token);
+                    if (read == 0) break;
+                    await output.WriteAsync(buffer.AsMemory(0, read), timeout.Token);
+                    received += read;
+                    if (clock.ElapsedMilliseconds - lastReport >= 700)
+                    {
+                        double mbps = received / 1024d / 1024d / Math.Max(0.001, clock.Elapsed.TotalSeconds);
+                        string sizeText = totalBytes.HasValue
+                            ? $"{received / 1048576d:F1}/{totalBytes.Value / 1048576d:F1} MB"
+                            : $"{received / 1048576d:F1} MB";
+                        string percent = totalBytes.HasValue && totalBytes.Value > 0
+                            ? $"（{Math.Min(100, received * 100d / totalBytes.Value):F0}%）" : "";
+                        SetStatus($"正在下载 Java {major}：{sizeText}{percent}，速度 {mbps:F2} MB/s，第 {attempt}/{maxAttempts} 次");
+                        lastReport = clock.ElapsedMilliseconds;
+                    }
+                }
+                await output.FlushAsync(timeout.Token);
+                if (totalBytes.HasValue && new FileInfo(partial).Length != totalBytes.Value)
+                    throw new IOException($"下载长度不完整：已收到 {new FileInfo(partial).Length} 字节，预期 {totalBytes.Value} 字节。将尝试续传。");
+
+                // 先完整打开 ZIP，避免损坏包进入安装目录。
+                using (var zip = ZipFile.OpenRead(partial))
+                {
+                    if (zip.Entries.Count == 0) throw new InvalidDataException("Java 压缩包为空。");
+                }
+                File.Move(partial, archive, true);
+                Log($"Java {major} 下载完成，文件大小：{new FileInfo(archive).Length / 1048576d:F1} MB。");
+                return;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                Log($"Java {major} 下载第 {attempt} 次失败：{ex.Message}");
+                if (attempt < maxAttempts)
+                {
+                    SetStatus($"Java {major} 下载中断，保留已下载数据，{attempt}/{maxAttempts} 次失败，准备续传……");
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(10, attempt * 2)));
+                }
+            }
+        }
+        throw new IOException($"Java {major} 下载连续失败 {maxAttempts} 次。已保留临时下载文件（如果服务器支持 Range，下次可续传）。最后错误：{lastError?.Message}", lastError);
+    }
+
+    private async Task<bool> TryDownloadJavaInParallelAsync(string url, string partial, int major)
+    {
+        const int workerCount = 4;
+        const int bufferSize = 1024 * 1024;
+        long totalLength;
+        try
+        {
+            using var probeRequest = new HttpRequestMessage(HttpMethod.Get, url);
+            probeRequest.Headers.Range = new RangeHeaderValue(0, 0);
+            using var probeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            using var probe = await JavaHttp.SendAsync(probeRequest, HttpCompletionOption.ResponseHeadersRead, probeTimeout.Token);
+            if (probe.StatusCode != System.Net.HttpStatusCode.PartialContent ||
+                probe.Content.Headers.ContentRange?.Length is not long detectedLength || detectedLength < 2 * 1024 * 1024)
+                return false;
+            totalLength = detectedLength;
+            // 丢弃探测响应的单字节内容，后续按明确的区间重新下载。
+            await using var probeStream = await probe.Content.ReadAsStreamAsync(probeTimeout.Token);
+            await probeStream.CopyToAsync(Stream.Null, 8192, probeTimeout.Token);
+        }
+        catch (Exception ex)
+        {
+            Log($"Java {major} 服务器不支持分段探测，改用普通下载：{ex.Message}");
+            return false;
+        }
+
+        long completed = 0;
+        var clock = Stopwatch.StartNew();
+        long segmentSize = (totalLength + workerCount - 1) / workerCount;
+        string[] segmentPaths = Enumerable.Range(0, workerCount).Select(i => partial + $".seg{i}").ToArray();
+        try
+        {
+            var tasks = Enumerable.Range(0, workerCount).Select(async index =>
+            {
+                long from = index * segmentSize;
+                long to = Math.Min(totalLength - 1, from + segmentSize - 1);
+                if (from > to) return;
+                string segmentPath = segmentPaths[index];
+                for (int attempt = 1; attempt <= 4; attempt++)
+                {
+                    try
+                    {
+                        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                        request.Headers.Range = new RangeHeaderValue(from, to);
+                        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+                        using var response = await JavaHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+                        if (response.StatusCode != System.Net.HttpStatusCode.PartialContent ||
+                            response.Content.Headers.ContentRange?.From != from ||
+                            response.Content.Headers.ContentRange?.To != to)
+                            throw new IOException("下载服务器未正确返回分段数据。");
+                        await using var input = await response.Content.ReadAsStreamAsync(timeout.Token);
+                        await using var output = new FileStream(segmentPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                            bufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                        byte[] buffer = new byte[bufferSize];
+                        long segmentReceived = 0;
+                        while (true)
+                        {
+                            int read = await input.ReadAsync(buffer.AsMemory(0, buffer.Length), timeout.Token);
+                            if (read == 0) break;
+                            await output.WriteAsync(buffer.AsMemory(0, read), timeout.Token);
+                            segmentReceived += read;
+                            long nowDone = Interlocked.Add(ref completed, read);
+                            double speed = nowDone / 1048576d / Math.Max(0.001, clock.Elapsed.TotalSeconds);
+                            SetStatus($"Java {major} 加速下载：{nowDone / 1048576d:F1}/{totalLength / 1048576d:F1} MB（{nowDone * 100d / totalLength:F0}%），{speed:F2} MB/s，4 路并发");
+                        }
+                        if (segmentReceived != to - from + 1)
+                            throw new IOException($"分段 {index + 1} 长度不完整。");
+                        return;
+                    }
+                    catch
+                    {
+                        if (File.Exists(segmentPath)) File.Delete(segmentPath);
+                        if (attempt == 4) throw;
+                        await Task.Delay(500 * attempt);
+                    }
+                }
+            });
+            await Task.WhenAll(tasks);
+            await using var combined = new FileStream(partial, FileMode.Create, FileAccess.Write, FileShare.None,
+                bufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            foreach (string segment in segmentPaths)
+            {
+                if (!File.Exists(segment)) continue;
+                await using var input = File.OpenRead(segment);
+                await input.CopyToAsync(combined, bufferSize);
+            }
+            await combined.FlushAsync();
+            if (new FileInfo(partial).Length != totalLength)
+                throw new IOException("分段合并后的文件大小不正确。");
+            using (var zip = ZipFile.OpenRead(partial))
+                if (zip.Entries.Count == 0) throw new InvalidDataException("Java 压缩包为空。");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log($"Java {major} 分段加速下载不可用，切换为断点续传模式：{ex.Message}");
+            if (File.Exists(partial)) File.Delete(partial);
+            return false;
+        }
+        finally
+        {
+            foreach (string segment in segmentPaths)
+                try { if (File.Exists(segment)) File.Delete(segment); } catch { }
+        }
     }
 
     private static bool IsJavaCompatible(string javaExe, int requiredMajor)

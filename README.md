@@ -1,4 +1,4 @@
-# X Launcher v3.4 开发版
+# X Launcher v3.5 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -20,3 +20,21 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - Modrinth 搜索和下载需要联网；本功能只安装 Modrinth 的 `mod` 项目，不把资源包、光影包当作模组。
 - 模组下载目前为单个发布文件安装；模组依赖需要用户按项目说明补齐，下载目标是当前 Minecraft 游戏目录的共享 `mods` 文件夹。
 - 本项目需要在 Windows x64 上使用 .NET 8 SDK 编译。源码包尚未由当前环境进行 Windows 编译或实际 Minecraft 启动测试。
+
+
+## v3.5 Java 下载优化
+- Java 运行时下载改为独立 HTTP 连接池，使用 1 MiB 缓冲区，减少磁盘与网络小块 I/O。
+- 下载服务器支持 HTTP Range 时，自动启用 4 路分段并发下载；不支持时自动回退。
+- 普通下载支持保留 `.part` 临时文件并尝试断点续传，最多 5 次重试。
+- 每隔约 0.7 秒显示已下载大小、百分比和 MB/s 速度。
+- 下载后先验证 ZIP 可读，再解压；解压后继续验证 Java 主版本号。
+- 说明：实际速度仍受网络、下载服务器限速和电脑带宽影响；并非所有服务器都支持分段下载。
+
+
+## v3.6 Lite（小体积版）
+
+- 改为 .NET 8 framework-dependent 单文件发布，启动器本体不再捆绑 .NET/WPF 运行时，以显著减小体积。
+- GitHub Actions 会检查整个发布目录是否不超过 10 MB；超过则构建失败，不会把超限包冒充为合格版本。
+- **运行前提：** Windows x64 电脑需要安装 .NET 8 Desktop Runtime（桌面运行时）。这部分运行环境不包含在启动器内，因此安装后启动器体积更小。
+- Java 仍由启动器按需下载，不包含在启动器安装包中。
+- 注意：本源码包已生成，但需要 GitHub Actions 实际发布后才能确认最终发布目录体积及启动情况。
