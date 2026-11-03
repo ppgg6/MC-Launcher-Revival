@@ -2,6 +2,12 @@
 
 Windows WPF / .NET 8 启动器。支持 Mojang 官方版本清单、Vanilla 文件安装、SHA-1/大小校验、Windows libraries 规则筛选、natives 解压、logging 配置下载、Java 主版本检测、现代/旧版启动参数、Minecraft 正版账号设备代码登录、离线本地账户启动。
 
+## v1.3 界面调整
+
+- 调整为 PCL2 风格的浅色布局：左侧导航、顶部标题栏、首页启动横幅、版本选择、账户卡片、Java 检测卡片、游戏目录与日志区域。
+- 保留原有微软正版登录、离线账户、版本清单、安装与启动事件绑定。
+- 本次主要是界面重构，不代表 Java 自动下载、多线程下载、Forge/Fabric 安装等功能已经实现。
+
 ## 编译
 
 需要 Windows 10/11、.NET 8 SDK：
