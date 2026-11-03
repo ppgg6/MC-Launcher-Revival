@@ -5,7 +5,7 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>MC_Launcher_Revival</AssemblyName>
+    <AssemblyName>XLauncher</AssemblyName>
     <RootNamespace>MC_Launcher_Revival</RootNamespace>
   </PropertyGroup>
 </Project>

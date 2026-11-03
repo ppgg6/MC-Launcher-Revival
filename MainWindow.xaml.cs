@@ -28,8 +28,9 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         GameDirectoryText.Text = _gameDir;
-        Log("MC Launcher Revival 3.0 开发版初始化：PCL2 风格界面、并发下载、Java 管理与模组管理。");
-        Log("启动器已初始化。请先配置 Microsoft OAuth Client ID，登录正版账号后启动游戏。");
+        Log("X 启动器初始化：独立下载页、启动页、设置页与模组管理。");
+        LoadSavedSettings();
+        Log("启动器已初始化。请先选择账户，再安装并启动游戏。");
     }
 
     private void Log(string text)
@@ -556,9 +557,42 @@ public partial class MainWindow : Window
 
     private void Settings_Click(object sender, RoutedEventArgs e)
     {
-        MessageBox.Show("当前支持：游戏目录、Java 自动检测、启动内存、Microsoft OAuth Client ID。请确保 Java 版本与所选 Minecraft 版本匹配。",
-            "设置", MessageBoxButton.OK, MessageBoxImage.Information);
+        var win = new Window { Title = "X 启动器设置", Width = 620, Height = 560, Owner = this, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = System.Windows.Media.Brushes.White };
+        var panel = new StackPanel { Margin = new Thickness(22) };
+        panel.Children.Add(new TextBlock { Text = "启动器设置", FontSize = 24, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0,0,0,16) });
+        TextBox AddField(string label, string value) { panel.Children.Add(new TextBlock { Text = label, Margin = new Thickness(0,8,0,4), Foreground = System.Windows.Media.Brushes.DimGray }); var box = new TextBox { Text = value, Padding = new Thickness(8) }; panel.Children.Add(box); return box; }
+        var dir = AddField("Minecraft 游戏目录", _gameDir);
+        var java = AddField("Java 可执行文件路径（留空则自动查找）", _javaPath ?? "");
+        var oauth = AddField("Microsoft OAuth Client ID", OAuthClientIdText.Text);
+        panel.Children.Add(new TextBlock { Text = "默认启动内存", Margin = new Thickness(0,10,0,4), Foreground = System.Windows.Media.Brushes.DimGray });
+        var memory = new ComboBox { Padding = new Thickness(6), ItemsSource = new[] { "1024", "2048", "4096", "6144", "8192", "12288", "16384" }, SelectedItem = GetMemory().ToString() }; panel.Children.Add(memory);
+        var auto = new CheckBox { Content = "启动器启动时自动检查已安装版本", IsChecked = true, Margin = new Thickness(0,14,0,6) }; panel.Children.Add(auto);
+        var note = new TextBlock { Text = "提示：修改游戏目录后，下载和启动页面都会使用新目录。Java 路径需指向 java.exe。", TextWrapping = TextWrapping.Wrap, Foreground = System.Windows.Media.Brushes.Gray, Margin = new Thickness(0,8,0,12) }; panel.Children.Add(note);
+        var buttons = new WrapPanel { HorizontalAlignment = HorizontalAlignment.Right }; var save = new Button { Content = "保存设置", Padding = new Thickness(18,9,18,9), Background = System.Windows.Media.Brushes.SteelBlue, Foreground = System.Windows.Media.Brushes.White }; var cancel = new Button { Content = "取消", Padding = new Thickness(18,9,18,9) }; buttons.Children.Add(save); buttons.Children.Add(cancel); panel.Children.Add(buttons);
+        save.Click += (_,__) => { try { _gameDir = dir.Text.Trim(); GameDirectoryText.Text = _gameDir; _javaPath = string.IsNullOrWhiteSpace(java.Text) ? null : java.Text.Trim(); OAuthClientIdText.Text = oauth.Text.Trim(); if (memory.SelectedItem is string m) { int idx = new[] {"1024","2048","4096","6144","8192"}.ToList().IndexOf(m); if (idx >= 0) MemoryCombo.SelectedIndex = Math.Min(idx, MemoryCombo.Items.Count - 1); else MemoryCombo.SelectedIndex = 2; } Directory.CreateDirectory(_gameDir); SaveSettings(); SetStatus("设置已保存"); win.Close(); } catch(Exception ex) { MessageBox.Show("保存失败：" + ex.Message); } };
+        cancel.Click += (_,__) => win.Close(); win.Content = new ScrollViewer { Content = panel }; win.ShowDialog();
     }
+
+    private string SettingsPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XLauncher", "settings.json");
+    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=Math.Clamp(new[]{1024,2048,4096,6144,8192,12288,16384}.ToList().IndexOf(mem),0,4); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
+    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString() }, new JsonSerializerOptions { WriteIndented=true })); }
+
+    private void DownloadPage_Click(object sender, RoutedEventArgs e)
+    {
+        var win = new Window { Title = "X · 下载游戏", Width = 900, Height = 650, Owner = this, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = System.Windows.Media.Brushes.White };
+        var root = new DockPanel { Margin = new Thickness(20) }; var head = new StackPanel(); head.Children.Add(new TextBlock { Text="下载游戏版本", FontSize=24, FontWeight=FontWeights.SemiBold }); head.Children.Add(new TextBlock { Text="在这里选择要下载的 Minecraft 版本；下载完成后会出现在‘启动游戏’页面。", Foreground=System.Windows.Media.Brushes.Gray, Margin=new Thickness(0,5,0,12) }); DockPanel.SetDock(head,Dock.Top); root.Children.Add(head);
+        var list = new ListView(); list.ItemsSource = _versions; list.DisplayMemberPath = "Id"; root.Children.Add(list);
+        var bottom = new StackPanel { Orientation=Orientation.Horizontal, Margin=new Thickness(0,12,0,0) }; DockPanel.SetDock(bottom,Dock.Bottom); var refresh = new Button { Content="刷新官方版本列表" }; var install = new Button { Content="下载 / 安装选中版本", Background=System.Windows.Media.Brushes.SteelBlue, Foreground=System.Windows.Media.Brushes.White }; var progress = new ProgressBar { Width=220, Height=14, Margin=new Thickness(12,8,0,0), IsIndeterminate=false }; bottom.Children.Add(refresh); bottom.Children.Add(install); bottom.Children.Add(progress); root.Children.Add(bottom);
+        refresh.Click += async (_,__) => { await LoadVersionsAsync(); list.ItemsSource=_versions; }; install.Click += async (_,__) => { if(list.SelectedItem is not VersionRow row) { MessageBox.Show("请先选择版本。"); return; } VersionsList.SelectedItem = _versions.FirstOrDefault(x=>x.Id==row.Id); if(VersionsList.SelectedItem==null) { MessageBox.Show("版本清单尚未加载，请先刷新。"); return; } win.Activate(); InstallSelected_Click(this, new RoutedEventArgs()); progress.Value=Progress.Value; };
+        win.Content=root; win.Loaded += async (_,__) => { if(_versions.Count==0) { await LoadVersionsAsync(); list.ItemsSource=_versions; } }; win.ShowDialog();
+    }
+
+    private void LaunchPage_Click(object sender, RoutedEventArgs e)
+    {
+        try { _gameDir=string.IsNullOrWhiteSpace(GameDirectoryText.Text)?_gameDir:GameDirectoryText.Text.Trim(); var versionsDir=Path.Combine(_gameDir,"versions"); Directory.CreateDirectory(versionsDir); var installed=Directory.GetDirectories(versionsDir).Select(Path.GetFileName).Where(id=>!string.IsNullOrWhiteSpace(id)).Where(id=>File.Exists(Path.Combine(versionsDir,id!,id+".json")) && File.Exists(Path.Combine(versionsDir,id!,id+".jar"))).ToList(); var win=new Window { Title="X · 启动游戏", Width=700, Height=500, Owner=this, WindowStartupLocation=WindowStartupLocation.CenterOwner, Background=System.Windows.Media.Brushes.White }; var panel=new StackPanel { Margin=new Thickness(22) }; panel.Children.Add(new TextBlock { Text="启动游戏", FontSize=25, FontWeight=FontWeights.SemiBold }); panel.Children.Add(new TextBlock { Text="这里只显示已经安装完成的版本，不会混入尚未下载的版本。", Foreground=System.Windows.Media.Brushes.Gray, Margin=new Thickness(0,5,0,14) }); var list=new ListBox { Height=260, ItemsSource=installed }; panel.Children.Add(list); var go=new Button { Content="启动选中版本", Padding=new Thickness(18,10,18,10), Background=System.Windows.Media.Brushes.SteelBlue, Foreground=System.Windows.Media.Brushes.White, HorizontalAlignment=HorizontalAlignment.Left }; panel.Children.Add(go); go.Click += (_,__) => { if(list.SelectedItem is not string id) { MessageBox.Show("请先选择已安装版本。"); return; } var row=_versions.FirstOrDefault(v=>v.Id==id) ?? new VersionRow(id,"local","本地安装",""); if(!_versions.Any(v=>v.Id==id)) _versions.Add(row); VersionsList.SelectedItem=row; Launch_Click(this,new RoutedEventArgs()); }; win.Content=panel; win.ShowDialog(); } catch(Exception ex) { MessageBox.Show("读取已安装版本失败："+ex.Message); }
+    }
+
+
 
     private void OpenDirectory_Click(object sender, RoutedEventArgs e)
     {
