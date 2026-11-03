@@ -117,8 +117,12 @@
        <Border Style="{StaticResource Card}" Margin="9,0,0,0">
         <StackPanel>
          <TextBlock Text="Java 环境" Style="{StaticResource SectionTitle}"/>
-         <TextBlock Text="检测本机 Java 运行环境。Java 自动安装器正在开发中，请先确保系统已安装对应版本。" Foreground="#7E8794" FontSize="12" TextWrapping="Wrap"/>
-         <WrapPanel Margin="-4,8,0,0"><Button Content="检测 Java" Click="DetectJava_Click"/><Button Content="自动安装 Java 21" Click="InstallJava_Click" Background="#4B83D6" Foreground="White" BorderThickness="0"/></WrapPanel>
+         <TextBlock Text="根据 Minecraft 版本元数据自动选择所需 Java 主版本（例如 Java 8、17、21、25）。启动时会检查兼容性，缺少时可自动安装 Temurin。" Foreground="#7E8794" FontSize="12" TextWrapping="Wrap"/>
+         <WrapPanel Margin="-4,8,0,0" VerticalAlignment="Center">
+          <TextBlock Text="手动安装版本" VerticalAlignment="Center" Margin="5,0,4,0" Foreground="#697484"/>
+          <ComboBox x:Name="JavaVersionCombo" Width="90" SelectedIndex="2" Padding="6"><ComboBoxItem Content="8"/><ComboBoxItem Content="17"/><ComboBoxItem Content="21"/><ComboBoxItem Content="25"/></ComboBox>
+          <Button Content="检测 Java" Click="DetectJava_Click"/><Button Content="安装所选 Java" Click="InstallJava_Click" Background="#4B83D6" Foreground="White" BorderThickness="0"/><Button Content="Java 管理中心" Click="JavaManager_Click"/>
+         </WrapPanel>
         </StackPanel>
        </Border>
       </StackPanel>

@@ -23,6 +23,7 @@ public partial class MainWindow : Window
     private string? _accessToken, _uuid, _username, _userType;
     private bool _offlineMode;
     private string? _javaPath;
+    private Dictionary<string, string> _versionJavaPaths = new(StringComparer.OrdinalIgnoreCase);
 
     public MainWindow()
     {
@@ -95,37 +96,220 @@ public partial class MainWindow : Window
 
     private async void InstallJava_Click(object sender, RoutedEventArgs e)
     {
-        var answer = MessageBox.Show("将从 Eclipse Adoptium 官方 API 下载并安装 Temurin Java 21（Windows x64）。是否继续？", "自动安装 Java 21", MessageBoxButton.YesNo, MessageBoxImage.Question);
-        if (answer != MessageBoxResult.Yes) return;
-        try
+        int major = JavaVersionCombo.SelectedItem is ComboBoxItem item && int.TryParse(item.Content?.ToString(), out int v) ? v : 21;
+        if (MessageBox.Show($"将从 Eclipse Adoptium 官方 API 下载 Temurin Java {major}（Windows x64）。是否继续？", $"自动安装 Java {major}", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        try { await InstallJavaRuntimeAsync(major); }
+        catch (Exception ex) { SetStatus("Java 自动安装失败：" + ex.Message); Log("Java 安装错误：" + ex); MessageBox.Show(ex.Message, "Java 安装失败"); }
+    }
+
+    private async Task<string> InstallJavaRuntimeAsync(int major)
+    {
+        if (major < 8 || major > 99) throw new ArgumentOutOfRangeException(nameof(major));
+        string javaRoot = Path.Combine(_gameDir, "runtime");
+        string installDir = Path.Combine(javaRoot, $"temurin-{major}");
+        Directory.CreateDirectory(javaRoot);
+        string? existing = Directory.Exists(installDir) ? Directory.GetFiles(installDir, "java.exe", SearchOption.AllDirectories).FirstOrDefault(x => x.Replace('\\','/').Contains("/bin/java.exe", StringComparison.OrdinalIgnoreCase)) : null;
+        if (existing != null && IsJavaCompatible(existing, major)) { _javaPath = existing; return existing; }
+        SetStatus($"正在查询 Adoptium 官方 Java {major} 下载包……");
+        Log($"开始下载 Eclipse Temurin Java {major}。安装目录：{installDir}");
+        string api = $"https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jre/hotspot/normal/eclipse";
+        string archive = Path.Combine(javaRoot, $"temurin-{major}.zip");
+        Exception? lastDownloadError = null;
+        for (int attempt = 1; attempt <= 3; attempt++)
         {
-            string javaRoot = Path.Combine(_gameDir, "runtime");
-            string installDir = Path.Combine(javaRoot, "temurin-21");
-            Directory.CreateDirectory(javaRoot);
-            SetStatus("正在查询 Adoptium 官方 Java 21 下载包……");
-            Log("开始下载 Eclipse Temurin Java 21。");
-            string api = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse";
-            string archive = Path.Combine(javaRoot, "temurin-21.zip");
-            using (var response = await Http.GetAsync(api, HttpCompletionOption.ResponseHeadersRead))
+            try
             {
+                using var response = await Http.GetAsync(api, HttpCompletionOption.ResponseHeadersRead);
                 response.EnsureSuccessStatusCode();
                 await using var input = await response.Content.ReadAsStreamAsync();
                 await using var output = new FileStream(archive, FileMode.Create, FileAccess.Write, FileShare.None, 131072, true);
                 await input.CopyToAsync(output);
+                lastDownloadError = null; break;
             }
-            SetStatus("下载完成，正在解压 Java 运行环境……");
-            if (Directory.Exists(installDir)) Directory.Delete(installDir, true);
-            Directory.CreateDirectory(installDir);
-            ZipFile.ExtractToDirectory(archive, installDir, true);
-            File.Delete(archive);
-            string? javaExe = Directory.GetFiles(installDir, "java.exe", SearchOption.AllDirectories).FirstOrDefault(x => x.Replace('\\','/').Contains("/bin/java.exe", StringComparison.OrdinalIgnoreCase));
-            if (javaExe == null) throw new FileNotFoundException("压缩包中没有找到 bin/java.exe。");
-            _javaPath = javaExe;
-            SetStatus("Java 21 安装完成：" + javaExe);
-            Log("Java 21 安装完成：" + javaExe);
+            catch (Exception ex) { lastDownloadError = ex; if (attempt < 3) await Task.Delay(1200 * attempt); }
         }
-        catch (Exception ex) { SetStatus("Java 自动安装失败：" + ex.Message); Log("Java 安装错误：" + ex); MessageBox.Show(ex.Message, "Java 安装失败"); }
+        if (lastDownloadError != null) throw new Exception($"Java {major} 下载连续失败 3 次。", lastDownloadError);
+        if (!File.Exists(archive) || new FileInfo(archive).Length < 1024 * 1024) throw new InvalidDataException("Java 下载包大小异常，已拒绝解压。");
+        SetStatus($"Java {major} 下载完成，正在解压……");
+        if (Directory.Exists(installDir)) Directory.Delete(installDir, true);
+        Directory.CreateDirectory(installDir);
+        ZipFile.ExtractToDirectory(archive, installDir, true);
+        File.Delete(archive);
+        string? javaExe = Directory.GetFiles(installDir, "java.exe", SearchOption.AllDirectories).FirstOrDefault(x => x.Replace('\\','/').Contains("/bin/java.exe", StringComparison.OrdinalIgnoreCase));
+        if (javaExe == null) throw new FileNotFoundException("压缩包中没有找到 bin/java.exe。");
+        if (!TryGetJavaMajor(javaExe, out int installedMajor) || installedMajor != major)
+        {
+            try { Directory.Delete(installDir, true); } catch { }
+            throw new InvalidDataException($"Java 安装校验失败：期望 Java {major}，实际检测到 {installedMajor}。");
+        }
+        _javaPath = javaExe;
+        SetStatus($"Java {major} 安装完成并通过版本校验：" + javaExe);
+        Log($"Java {major} 安装完成：" + javaExe);
+        return javaExe;
     }
+
+    private static bool IsJavaCompatible(string javaExe, int requiredMajor)
+    {
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo(javaExe, "-version") { RedirectStandardError = true, RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true });
+            if (p == null) return false;
+            string output = p.StandardError.ReadToEnd() + p.StandardOutput.ReadToEnd(); p.WaitForExit(5000);
+            var m = System.Text.RegularExpressions.Regex.Match(output, @"version ""(?<v>\d+(?:\.\d+)*)");
+            if (!m.Success) return false;
+            var parts = m.Groups["v"].Value.Split('.'); int found = parts[0] == "1" && parts.Length > 1 ? int.Parse(parts[1]) : int.Parse(parts[0]);
+            return found == requiredMajor;
+        }
+        catch { return false; }
+    }
+
+    private async void JavaManager_Click(object sender, RoutedEventArgs e)
+    {
+        var win = new Window { Title = "X · Java 管理中心", Width = 1120, Height = 650, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = System.Windows.Media.Brushes.White };
+        var root = new DockPanel { Margin = new Thickness(20) };
+        var title = new StackPanel();
+        title.Children.Add(new TextBlock { Text = "Java 管理中心", FontSize = 25, FontWeight = FontWeights.SemiBold });
+        title.Children.Add(new TextBlock { Text = "统一查看、添加、安装和管理 Java 运行环境。不同 Minecraft 版本可以使用不同主版本。",
+            Foreground = System.Windows.Media.Brushes.Gray, Margin = new Thickness(0, 5, 0, 14) });
+        DockPanel.SetDock(title, Dock.Top); root.Children.Add(title);
+        var list = new ListView { Margin = new Thickness(0, 0, 0, 12) };
+        list.View = new System.Windows.Controls.GridView();
+        var view = (System.Windows.Controls.GridView)list.View;
+        view.Columns.Add(new System.Windows.Controls.GridViewColumn { Header = "Java 主版本", DisplayMemberBinding = new System.Windows.Data.Binding("Major"), Width = 105 });
+        view.Columns.Add(new System.Windows.Controls.GridViewColumn { Header = "来源", DisplayMemberBinding = new System.Windows.Data.Binding("Source"), Width = 125 });
+        view.Columns.Add(new System.Windows.Controls.GridViewColumn { Header = "状态", DisplayMemberBinding = new System.Windows.Data.Binding("Status"), Width = 100 });
+        view.Columns.Add(new System.Windows.Controls.GridViewColumn { Header = "java.exe 路径", DisplayMemberBinding = new System.Windows.Data.Binding("Path"), Width = 440 });
+        var buttons = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) }; DockPanel.SetDock(buttons, Dock.Bottom);
+        var refresh = new Button { Content = "重新扫描" };
+        var add = new Button { Content = "手动添加 Java" };
+        var install = new Button { Content = "安装 Java 8 / 17 / 21 / 25" };
+        var use = new Button { Content = "设为启动器优先 Java" };
+        var remove = new Button { Content = "删除启动器托管 Java" };
+        var repair = new Button { Content = "检查 / 修复 Java" };
+        var knownVersions = _versions.Select(v => v.Id).Concat(Directory.Exists(Path.Combine(_gameDir, "versions")) ? Directory.GetDirectories(Path.Combine(_gameDir, "versions")).Select(Path.GetFileName).Where(x => !string.IsNullOrWhiteSpace(x))! : Enumerable.Empty<string>()).Distinct().ToList();
+        var versionPick = new ComboBox { Width = 125, Margin = new Thickness(5), ItemsSource = knownVersions, IsEditable = true };
+        var assign = new Button { Content = "指定给所选游戏版本" };
+        foreach (var b in new[] { refresh, add, install, use, remove, repair }) buttons.Children.Add(b);
+        buttons.Children.Add(new TextBlock { Text = "游戏版本：", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8,0,0,0) });
+        buttons.Children.Add(versionPick); buttons.Children.Add(assign);
+        root.Children.Add(buttons); root.Children.Add(list);
+        List<JavaEntry> entries = new();
+        void Refresh()
+        {
+            entries = ScanJavaEntries(); list.ItemsSource = null; list.ItemsSource = entries;
+            SetStatus($"Java 管理中心：发现 {entries.Count} 个 Java 环境。");
+        }
+        refresh.Click += (_, __) => Refresh();
+        add.Click += (_, __) =>
+        {
+            var picker = new OpenFileDialog { Title = "选择 Java 可执行文件", Filter = "Java 可执行文件 (java.exe)|java.exe|所有文件 (*.*)|*.*" };
+            if (picker.ShowDialog(win) == true)
+            {
+                if (!File.Exists(picker.FileName) || !TryGetJavaMajor(picker.FileName, out int major)) { MessageBox.Show(win, "所选文件不是可识别的 Java。", "添加失败"); return; }
+                _javaPath = picker.FileName; SaveSettings(); Refresh(); Log($"已将 Java {major} 设置为启动器优先环境：{_javaPath}");
+            }
+        };
+        install.Click += async (_, __) =>
+        {
+            var choose = new Window { Title = "安装 Java", Width = 330, Height = 180, Owner = win, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = System.Windows.Media.Brushes.White };
+            var panel = new StackPanel { Margin = new Thickness(18) }; panel.Children.Add(new TextBlock { Text = "选择要安装的 Temurin Java 主版本：", Margin = new Thickness(0,0,0,10) });
+            var combo = new ComboBox { ItemsSource = new[] { "8", "17", "21", "25" }, SelectedItem = "21", Padding = new Thickness(6) }; panel.Children.Add(combo);
+            var go = new Button { Content = "开始安装", Margin = new Thickness(0,12,0,0), HorizontalAlignment = HorizontalAlignment.Right }; panel.Children.Add(go); choose.Content = panel;
+            go.Click += async (_, ____) => { int major = int.Parse(combo.SelectedItem?.ToString() ?? "21"); go.IsEnabled = false; try { _javaPath = await InstallJavaRuntimeAsync(major); SaveSettings(); Refresh(); MessageBox.Show(choose, $"Java {major} 安装完成。", "安装成功"); choose.Close(); } catch (Exception ex) { MessageBox.Show(choose, ex.Message, "安装失败"); } finally { go.IsEnabled = true; } };
+            choose.ShowDialog();
+        };
+        use.Click += (_, __) => { if (list.SelectedItem is not JavaEntry entry) { MessageBox.Show(win, "请先选择一个 Java 环境。"); return; } _javaPath = entry.Path; SaveSettings(); SetStatus($"已设为优先 Java：{entry.Major}"); Log("启动器优先 Java 已设置为：" + entry.Path); };
+        remove.Click += (_, __) =>
+        {
+            if (list.SelectedItem is not JavaEntry entry) { MessageBox.Show(win, "请先选择一个 Java 环境。"); return; }
+            string managedRoot = Path.GetFullPath(Path.Combine(_gameDir, "runtime")) + Path.DirectorySeparatorChar;
+            string selectedPath = Path.GetFullPath(entry.Path);
+            if (!selectedPath.StartsWith(managedRoot, StringComparison.OrdinalIgnoreCase)) { MessageBox.Show(win, "为避免误删电脑已有 Java，只能删除 X 启动器 runtime 目录内托管的环境。"); return; }
+            if (MessageBox.Show(win, $"确定删除这个启动器托管的 Java 环境吗？\n{entry.Path}", "确认删除", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+            string javaHome = Directory.GetParent(Path.GetDirectoryName(entry.Path)!)?.FullName ?? "";
+            // Adoptium archives may contain one nested top-level directory; remove only the matching managed major folder.
+            string majorFolder = Path.Combine(_gameDir, "runtime", "temurin-" + entry.Major);
+            if (Directory.Exists(majorFolder)) Directory.Delete(majorFolder, true);
+            if (string.Equals(_javaPath, entry.Path, StringComparison.OrdinalIgnoreCase)) _javaPath = null;
+            SaveSettings(); Refresh(); Log($"已删除启动器托管 Java {entry.Major}。");
+        };
+        repair.Click += async (_, __) =>
+        {
+            repair.IsEnabled = false;
+            try
+            {
+                foreach (int major in new[] { 8, 17, 21, 25 })
+                {
+                    string folder = Path.Combine(_gameDir, "runtime", $"temurin-{major}");
+                    string? exe = Directory.Exists(folder) ? Directory.GetFiles(folder, "java.exe", SearchOption.AllDirectories).FirstOrDefault(x => x.Replace('\\','/').EndsWith("/bin/java.exe", StringComparison.OrdinalIgnoreCase)) : null;
+                    if (exe == null || !TryGetJavaMajor(exe, out int detectedMajor) || detectedMajor != major)
+                    {
+                        SetStatus($"Java {major} 缺失或校验失败，正在修复……");
+                        await InstallJavaRuntimeAsync(major);
+                    }
+                }
+                SaveSettings(); Refresh(); MessageBox.Show(win, "Java 8、17、21、25 检查完成；缺失或损坏的托管环境已尝试修复。", "检查完成");
+            }
+            catch (Exception ex) { MessageBox.Show(win, "Java 修复失败：" + ex.Message); }
+            finally { repair.IsEnabled = true; }
+        };
+        assign.Click += (_, __) =>
+        {
+            string version = versionPick.Text.Trim(); if (string.IsNullOrWhiteSpace(version)) { MessageBox.Show(win, "请先选择或输入游戏版本号。"); return; }
+            if (list.SelectedItem is not JavaEntry entry || !File.Exists(entry.Path)) { MessageBox.Show(win, "请先在上方列表选择有效 Java。"); return; }
+            int required = version.StartsWith("1.20.5", StringComparison.OrdinalIgnoreCase) || version.StartsWith("1.21", StringComparison.OrdinalIgnoreCase) ? 21 : version.StartsWith("1.18", StringComparison.OrdinalIgnoreCase) || version.StartsWith("1.19", StringComparison.OrdinalIgnoreCase) || version.StartsWith("1.20", StringComparison.OrdinalIgnoreCase) ? 17 : 8;
+            using (var versionDoc = TryReadVersionMetadata(version))
+                if (versionDoc != null && versionDoc.RootElement.TryGetProperty("javaVersion", out var jv) && jv.TryGetProperty("majorVersion", out var jm)) required = jm.GetInt32();
+            if (!IsJavaCompatible(entry.Path, required)) { MessageBox.Show(win, $"该版本元数据要求 Java {required}，当前所选 Java 主版本不匹配。"); return; }
+            _versionJavaPaths[version] = entry.Path; SaveSettings(); Log($"已为 Minecraft {version} 指定 Java：{entry.Path}");
+            MessageBox.Show(win, $"已为 {version} 指定 Java {entry.Major}。", "设置成功");
+        };
+        Refresh(); win.Content = root; win.ShowDialog();
+    }
+
+    private List<JavaEntry> ScanJavaEntries()
+    {
+        var candidates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        void Add(string? path, string source) { if (!string.IsNullOrWhiteSpace(path) && File.Exists(path)) candidates[path] = source; }
+        Add(_javaPath, "启动器优先");
+        string? home = Environment.GetEnvironmentVariable("JAVA_HOME");
+        if (!string.IsNullOrWhiteSpace(home)) Add(Path.Combine(home, "bin", "java.exe"), "JAVA_HOME");
+        foreach (var part in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)) Add(Path.Combine(part.Trim('"'), "java.exe"), "系统 PATH");
+        string runtime = Path.Combine(_gameDir, "runtime");
+        if (Directory.Exists(runtime)) foreach (var file in Directory.GetFiles(runtime, "java.exe", SearchOption.AllDirectories)) Add(file, "X 托管运行时");
+        foreach (var baseDir in new[] { Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86) })
+        {
+            string adoptium = Path.Combine(baseDir, "Eclipse Adoptium");
+            if (Directory.Exists(adoptium)) foreach (var file in Directory.GetFiles(adoptium, "java.exe", SearchOption.AllDirectories)) Add(file, "系统已安装");
+        }
+        var result = new List<JavaEntry>();
+        foreach (var item in candidates)
+        {
+            if (TryGetJavaMajor(item.Key, out int major)) result.Add(new JavaEntry(major.ToString(), item.Value, "可用", item.Key));
+            else result.Add(new JavaEntry("未知", item.Value, "无法识别", item.Key));
+        }
+        return result.OrderBy(x => int.TryParse(x.Major, out int n) ? n : 999).ThenBy(x => x.Source).ToList();
+    }
+
+    private static bool TryGetJavaMajor(string javaExe, out int major)
+    {
+        major = 0;
+        try
+        {
+            using var p = Process.Start(new ProcessStartInfo(javaExe, "-version") { RedirectStandardError = true, RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true });
+            if (p == null) return false;
+            string output = p.StandardError.ReadToEnd() + p.StandardOutput.ReadToEnd();
+            if (!p.WaitForExit(8000)) { p.Kill(true); return false; }
+            var m = System.Text.RegularExpressions.Regex.Match(output, @"version ""(?<v>\d+(?:\.\d+)*)");
+            if (!m.Success) return false;
+            var parts = m.Groups["v"].Value.Split('.'); major = parts[0] == "1" && parts.Length > 1 ? int.Parse(parts[1]) : int.Parse(parts[0]);
+            return major > 0;
+        }
+        catch { return false; }
+    }
+
+    private sealed record JavaEntry(string Major, string Source, string Status, string Path);
 
     private void ChooseDirectory_Click(object sender, RoutedEventArgs e)
     {
@@ -483,7 +667,26 @@ public partial class MainWindow : Window
             if (!File.Exists(jsonPath) || !File.Exists(jarPath)) throw new FileNotFoundException("所选版本尚未完整安装，请先安装。 ");
             using var doc = JsonDocument.Parse(await File.ReadAllTextAsync(jsonPath)); var meta = doc.RootElement;
             int javaMajor = meta.TryGetProperty("javaVersion", out var jv) && jv.TryGetProperty("majorVersion", out var jm) ? jm.GetInt32() : (selected.Id.StartsWith("1.20.5") || selected.Id.StartsWith("1.21") ? 21 : selected.Id.StartsWith("1.18") || selected.Id.StartsWith("1.19") || selected.Id.StartsWith("1.20") ? 17 : 8);
-            string java = FindJava(javaMajor); string natives = Path.Combine(versionDir, "natives");
+            string java;
+            try
+            {
+                if (_versionJavaPaths.TryGetValue(selected.Id, out var assigned) && !string.IsNullOrWhiteSpace(assigned))
+                {
+                    if (!File.Exists(assigned) || !IsJavaCompatible(assigned, javaMajor))
+                        throw new FileNotFoundException($"版本 {selected.Id} 指定的 Java 不存在或版本不兼容（需要 Java {javaMajor}+）：{assigned}");
+                    java = assigned;
+                }
+                else java = FindJava(javaMajor);
+            }
+            catch (FileNotFoundException)
+            {
+                var choice = MessageBox.Show($"Minecraft {selected.Id} 需要 Java {javaMajor}。当前没有找到对应主版本的运行环境。现在自动下载并安装 Java {javaMajor} 吗？", "缺少匹配的 Java", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (choice != MessageBoxResult.Yes) return;
+                java = await InstallJavaRuntimeAsync(javaMajor);
+                SaveSettings();
+            }
+            Log($"版本 {selected.Id} 使用 Java {javaMajor}：{java}");
+            string natives = Path.Combine(versionDir, "natives");
             var cp = new List<string>(); if (meta.TryGetProperty("libraries", out var libs)) foreach (var lib in libs.EnumerateArray()) if (IsAllowed(lib) && lib.TryGetProperty("downloads", out var dl) && dl.TryGetProperty("artifact", out var art)) { var lp = ResolveLibraryPath(art); if (lp != null && File.Exists(lp)) cp.Add(lp); }
             cp.Add(jarPath);
             string assetIndex = meta.TryGetProperty("assetIndex", out var ai) ? ai.GetProperty("id").GetString()! : selected.Id;
@@ -519,8 +722,23 @@ public partial class MainWindow : Window
     private int GetMemory() => MemoryCombo.SelectedItem is ComboBoxItem item && int.TryParse(item.Content?.ToString(),out int mb) ? mb : 4096;
     private string FindJava(int major)
     {
-        var candidates=new List<string>(); if (!string.IsNullOrWhiteSpace(_javaPath) && File.Exists(_javaPath)) candidates.Add(_javaPath); string? home=Environment.GetEnvironmentVariable("JAVA_HOME"); if(!string.IsNullOrWhiteSpace(home)) candidates.Add(Path.Combine(home,"bin","java.exe")); candidates.Add("java.exe");
-        foreach(var candidate in candidates) try { var p=Process.Start(new ProcessStartInfo(candidate,"-version"){RedirectStandardError=true,UseShellExecute=false,CreateNoWindow=true}); if(p==null) continue; string output=p.StandardError.ReadToEnd(); p.WaitForExit(); var m=System.Text.RegularExpressions.Regex.Match(output,@"version ""(?<v>\d+(?:\.\d+)*)"); int found=8; if(m.Success) { var parts=m.Groups["v"].Value.Split('.'); found=parts[0]=="1" && parts.Length>1 ? int.Parse(parts[1]) : int.Parse(parts[0]); } if(found>=major) return candidate; } catch{} throw new FileNotFoundException($"需要 Java {major} 或更高版本，请安装并配置 JAVA_HOME。");
+        var candidates = new List<string>();
+        if (!string.IsNullOrWhiteSpace(_javaPath) && File.Exists(_javaPath)) candidates.Add(_javaPath);
+        string? home = Environment.GetEnvironmentVariable("JAVA_HOME");
+        if (!string.IsNullOrWhiteSpace(home)) candidates.Add(Path.Combine(home, "bin", "java.exe"));
+        candidates.Add("java.exe");
+        // Also search launcher-managed runtimes, newest compatible Java first.
+        string runtimeRoot = Path.Combine(_gameDir, "runtime");
+        if (Directory.Exists(runtimeRoot)) candidates.AddRange(Directory.GetFiles(runtimeRoot, "java.exe", SearchOption.AllDirectories));
+        foreach (var candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+            if ((File.Exists(candidate) || candidate == "java.exe") && IsJavaCompatible(candidate, major)) { _javaPath = candidate; return candidate; }
+        throw new FileNotFoundException($"此 Minecraft 版本需要 Java {major}。没有找到匹配的 Java 主版本。");
+    }
+
+    private JsonDocument? TryReadVersionMetadata(string version)
+    {
+        try { string path = Path.Combine(_gameDir, "versions", version, version + ".json"); return File.Exists(path) ? JsonDocument.Parse(File.ReadAllText(path)) : null; }
+        catch { return null; }
     }
 
     private void Mods_Click(object sender, RoutedEventArgs e)
@@ -549,10 +767,82 @@ public partial class MainWindow : Window
             remove.Click += (_,__) => { if (list.SelectedItem is string name) { File.Delete(Path.Combine(modsDir, name)); Refresh(); } };
             var fabric = new Button { Content = "Fabric 官方下载", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
             fabric.Click += (_,__) => Process.Start(new ProcessStartInfo("https://fabricmc.net/use/installer/") { UseShellExecute = true });
-            buttons.Children.Add(open); buttons.Children.Add(import); buttons.Children.Add(remove); buttons.Children.Add(forge); buttons.Children.Add(fabric);
+            var browse = new Button { Content = "在线搜索 / 下载模组（Modrinth）", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7), Background = System.Windows.Media.Brushes.SteelBlue, Foreground = System.Windows.Media.Brushes.White };
+            browse.Click += async (_,__) => await OpenModrinthBrowserAsync(modsDir, Refresh);
+            buttons.Children.Add(open); buttons.Children.Add(import); buttons.Children.Add(remove); buttons.Children.Add(forge); buttons.Children.Add(fabric); buttons.Children.Add(browse);
             root.Children.Add(buttons); root.Children.Add(list); window.Content = root; Refresh(); window.ShowDialog();
         }
         catch (Exception ex) { MessageBox.Show("打开模组管理失败：" + ex.Message); }
+    }
+
+    private sealed record ModrinthHit(string ProjectId, string Title, string Description, string Slug, string Downloads, string IconUrl);
+
+    private async Task OpenModrinthBrowserAsync(string modsDir, Action refreshMods)
+    {
+        var win = new Window { Title = "X · Modrinth 模组下载中心", Width = 980, Height = 690, Owner = this, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = System.Windows.Media.Brushes.White };
+        var root = new DockPanel { Margin = new Thickness(20) };
+        var top = new StackPanel();
+        top.Children.Add(new TextBlock { Text = "在线模组下载中心", FontSize = 24, FontWeight = FontWeights.SemiBold });
+        top.Children.Add(new TextBlock { Text = "通过 Modrinth 官方 API 搜索模组。请确保所选 Minecraft 版本和加载器与游戏一致。", Foreground = System.Windows.Media.Brushes.Gray, Margin = new Thickness(0,5,0,10) });
+        var controls = new WrapPanel(); var query = new TextBox { Width = 300, Padding = new Thickness(8), Text = "" }; var mc = new TextBox { Width = 100, Padding = new Thickness(8), Text = "1.20.1" };
+        var loader = new ComboBox { Width = 120, Padding = new Thickness(6), ItemsSource = new[] { "fabric", "forge", "neoforge", "quilt" }, SelectedIndex = 0 };
+        var search = new Button { Content = "搜索模组", Background = System.Windows.Media.Brushes.SteelBlue, Foreground = System.Windows.Media.Brushes.White };
+        controls.Children.Add(new TextBlock { Text = "关键词", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4) }); controls.Children.Add(query);
+        controls.Children.Add(new TextBlock { Text = "Minecraft", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8,4,4,4) }); controls.Children.Add(mc);
+        controls.Children.Add(new TextBlock { Text = "加载器", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8,4,4,4) }); controls.Children.Add(loader); controls.Children.Add(search);
+        top.Children.Add(controls); DockPanel.SetDock(top, Dock.Top); root.Children.Add(top);
+        var results = new ListView { Margin = new Thickness(0,12,0,12) };
+        var grid = new GridView(); grid.Columns.Add(new GridViewColumn { Header = "模组名称", DisplayMemberBinding = new System.Windows.Data.Binding("Title"), Width = 190 });
+        grid.Columns.Add(new GridViewColumn { Header = "简介", DisplayMemberBinding = new System.Windows.Data.Binding("Description"), Width = 490 });
+        grid.Columns.Add(new GridViewColumn { Header = "下载量", DisplayMemberBinding = new System.Windows.Data.Binding("Downloads"), Width = 100 }); results.View = grid; root.Children.Add(results);
+        var bottom = new StackPanel { Orientation = Orientation.Horizontal }; DockPanel.SetDock(bottom, Dock.Bottom);
+        var install = new Button { Content = "下载并安装选中模组", Background = System.Windows.Media.Brushes.SeaGreen, Foreground = System.Windows.Media.Brushes.White };
+        var openProject = new Button { Content = "打开项目网页" }; var status = new TextBlock { Text = "搜索结果将显示在这里。", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10,0,0,0) };
+        var progress = new ProgressBar { Width = 170, Height = 14, Margin = new Thickness(8,8,0,0) }; bottom.Children.Add(install); bottom.Children.Add(openProject); bottom.Children.Add(progress); bottom.Children.Add(status); root.Children.Add(bottom);
+        List<ModrinthHit> hits = new();
+        search.Click += async (_,__) =>
+        {
+            if (string.IsNullOrWhiteSpace(query.Text)) { MessageBox.Show(win, "请输入模组名称或关键词。"); return; }
+            search.IsEnabled = false; status.Text = "正在搜索 Modrinth……";
+            try
+            {
+                string url = "https://api.modrinth.com/v2/search?query=" + Uri.EscapeDataString(query.Text.Trim()) + "&facets=" + Uri.EscapeDataString("[[\"project_type:mod\"]]") + "&limit=30";
+                using var req = new HttpRequestMessage(HttpMethod.Get, url); req.Headers.UserAgent.ParseAdd("XLauncher/3.4 (https://github.com/ppgg6/MC-Launcher-Revival)");
+                using var resp = await Http.SendAsync(req); resp.EnsureSuccessStatusCode(); using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+                hits = doc.RootElement.GetProperty("hits").EnumerateArray().Select(x => new ModrinthHit(x.GetProperty("project_id").GetString() ?? "", x.GetProperty("title").GetString() ?? "", x.GetProperty("description").GetString() ?? "", x.GetProperty("slug").GetString() ?? "", x.GetProperty("downloads").ToString(), x.TryGetProperty("icon_url", out var icon) ? icon.GetString() ?? "" : "")).ToList();
+                results.ItemsSource = hits; status.Text = $"找到 {hits.Count} 个项目。安装时会再次核对版本和加载器。";
+            }
+            catch (Exception ex) { status.Text = "搜索失败：" + ex.Message; }
+            finally { search.IsEnabled = true; }
+        };
+        openProject.Click += (_,__) => { if (results.SelectedItem is ModrinthHit hit) Process.Start(new ProcessStartInfo("https://modrinth.com/mod/" + Uri.EscapeDataString(hit.Slug)) { UseShellExecute = true }); };
+        install.Click += async (_,__) =>
+        {
+            if (results.SelectedItem is not ModrinthHit hit) { MessageBox.Show(win, "请先选择一个模组。"); return; }
+            if (string.IsNullOrWhiteSpace(mc.Text) || loader.SelectedItem is not string loaderName) { MessageBox.Show(win, "请填写 Minecraft 版本并选择加载器。"); return; }
+            install.IsEnabled = false; progress.IsIndeterminate = true; status.Text = "正在查找兼容文件……";
+            try
+            {
+                string versionsUrl = $"https://api.modrinth.com/v2/project/{Uri.EscapeDataString(hit.ProjectId)}/version?game_versions={Uri.EscapeDataString(JsonSerializer.Serialize(new[] { mc.Text.Trim() }))}&loaders={Uri.EscapeDataString(JsonSerializer.Serialize(new[] { loaderName }))}";
+                using var req = new HttpRequestMessage(HttpMethod.Get, versionsUrl); req.Headers.UserAgent.ParseAdd("XLauncher/3.4 (https://github.com/ppgg6/MC-Launcher-Revival)");
+                using var resp = await Http.SendAsync(req); resp.EnsureSuccessStatusCode(); using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+                var version = doc.RootElement.EnumerateArray().FirstOrDefault();
+                if (version.ValueKind != JsonValueKind.Object) throw new Exception($"没有找到适用于 Minecraft {mc.Text} + {loaderName} 的发布文件。请确认版本和加载器。 ");
+                var file = version.GetProperty("files").EnumerateArray().FirstOrDefault(f => f.TryGetProperty("primary", out var primary) && primary.GetBoolean());
+                if (file.ValueKind != JsonValueKind.Object) file = version.GetProperty("files")[0];
+                string fileName = Path.GetFileName(file.GetProperty("filename").GetString() ?? "mod.jar"); string downloadUrl = file.GetProperty("url").GetString() ?? throw new Exception("模组文件缺少下载地址。");
+                if (!fileName.EndsWith(".jar", StringComparison.OrdinalIgnoreCase)) throw new Exception("下载文件不是 JAR 模组，已取消安装。");
+                Directory.CreateDirectory(modsDir); string target = Path.Combine(modsDir, fileName);
+                if (File.Exists(target) && MessageBox.Show(win, $"{fileName} 已存在。是否覆盖？", "文件已存在", MessageBoxButton.YesNo) != MessageBoxResult.Yes) return;
+                await DownloadAndVerifyAsync(downloadUrl, target, file.TryGetProperty("hashes", out var hashes) && hashes.TryGetProperty("sha1", out var sha) ? sha.GetString() : null, file.TryGetProperty("size", out var size) ? size.GetInt64() : null);
+                refreshMods(); status.Text = "安装完成：" + fileName;
+                Log($"从 Modrinth 安装模组：{hit.Title} / {fileName}（MC {mc.Text}, {loaderName}）");
+                MessageBox.Show(win, $"模组已下载到 mods 文件夹：\n{fileName}\n\n如果它依赖其他模组，请按项目页面说明安装依赖。", "安装完成");
+            }
+            catch (Exception ex) { status.Text = "安装失败：" + ex.Message; MessageBox.Show(win, ex.Message, "模组下载失败"); }
+            finally { progress.IsIndeterminate = false; install.IsEnabled = true; }
+        };
+        win.Content = root; win.ShowDialog();
     }
 
     private void Settings_Click(object sender, RoutedEventArgs e)
@@ -574,8 +864,8 @@ public partial class MainWindow : Window
     }
 
     private string SettingsPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XLauncher", "settings.json");
-    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=Math.Clamp(new[]{1024,2048,4096,6144,8192,12288,16384}.ToList().IndexOf(mem),0,4); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
-    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString() }, new JsonSerializerOptions { WriteIndented=true })); }
+    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=Math.Clamp(new[]{1024,2048,4096,6144,8192,12288,16384}.ToList().IndexOf(mem),0,4); if(r.TryGetProperty("versionJavaPaths",out var mappings)&&mappings.ValueKind==JsonValueKind.Object) _versionJavaPaths=mappings.EnumerateObject().Where(x=>x.Value.ValueKind==JsonValueKind.String).ToDictionary(x=>x.Name,x=>x.Value.GetString()!,StringComparer.OrdinalIgnoreCase); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
+    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString(), versionJavaPaths=_versionJavaPaths }, new JsonSerializerOptions { WriteIndented=true })); }
 
     private void DownloadPage_Click(object sender, RoutedEventArgs e)
     {
