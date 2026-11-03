@@ -1,0 +1,83 @@
+<Window x:Class="MC_Launcher_Revival.MainWindow"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ Title="MC Launcher Revival 1.2" Height="800" Width="1180" MinHeight="700" MinWidth="980"
+ WindowStartupLocation="CenterScreen" Background="{StaticResource WindowBg}" Foreground="{StaticResource Text}">
+ <Grid>
+  <Grid.ColumnDefinitions><ColumnDefinition Width="230"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+  <Border Grid.Column="0" Background="#111C2B">
+   <DockPanel Margin="18">
+    <StackPanel DockPanel.Dock="Top">
+     <TextBlock Text="MC LAUNCHER" FontSize="22" FontWeight="Bold" Foreground="{StaticResource Accent}"/>
+     <TextBlock Text="REVIVAL  ·  VERSION 1.2" FontSize="10" Foreground="#9EADC2" Margin="0,4,0,28"/>
+     <Button Content="⌂  首页" HorizontalContentAlignment="Left" Background="#263D5E"/>
+     <Button Content="▣  版本安装" HorizontalContentAlignment="Left" Click="LoadVersions_Click"/>
+     <Button Content="☕  Mod / 整合包" HorizontalContentAlignment="Left" Background="#253044" IsEnabled="False"/>
+     <Button Content="⚙  设置" HorizontalContentAlignment="Left" Background="#253044" Click="Settings_Click"/>
+     <Button Content="📂  打开游戏目录" HorizontalContentAlignment="Left" Background="#253044" Click="OpenDirectory_Click"/>
+    </StackPanel>
+    <TextBlock DockPanel.Dock="Bottom" Text="独立第三方项目；非 PCL 官方产品。" TextWrapping="Wrap" FontSize="10" Foreground="#8EA0B8" Margin="0,20,0,0"/>
+   </DockPanel>
+  </Border>
+  <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto">
+   <StackPanel Margin="28">
+    <TextBlock Text="Minecraft Java 版启动器" FontSize="30" FontWeight="SemiBold"/>
+    <TextBlock Text="独立开发 · 官方版本清单 · 安装器 · Java 检测 · 日志" Foreground="#AAB8CC" Margin="0,8,0,20"/>
+    <Border Background="{StaticResource Panel}" CornerRadius="14" Padding="20">
+     <StackPanel>
+      <TextBlock Text="账户与启动" FontSize="20" FontWeight="SemiBold"/>
+      <TextBlock Text="使用你自己的 Microsoft OAuth 应用 Client ID 登录正版账号。不会收集或保存密码；登录令牌仅保存在当前用户本机。" TextWrapping="Wrap" Foreground="#B9C7D9" Margin="0,7,0,10"/>
+      <WrapPanel Margin="0,0,0,8">
+       <TextBlock Text="Microsoft OAuth Client ID" VerticalAlignment="Center" Margin="4"/>
+       <TextBox x:Name="OAuthClientIdText" Width="330" Padding="7" Background="#101A29" Foreground="White" BorderBrush="#35445B"/>
+       <Button Content="微软正版登录" Click="MicrosoftLogin_Click" Background="#2563A6"/>
+       <Button Content="离线 / 本地账户" Click="OfflineLogin_Click" Background="#287A65"/>
+       <Button Content="退出账户" Click="Logout_Click" Background="#5B4650"/>
+      </WrapPanel>
+      <TextBlock x:Name="AccountStatusText" Text="账号：未登录（可选择正版登录或离线模式）" Foreground="#F2C879" Margin="4,0,4,8"/>
+      <WrapPanel VerticalAlignment="Center">
+       <TextBlock Text="玩家昵称（仅用于本地配置，不代表已认证）" VerticalAlignment="Center" Margin="4"/>
+       <TextBox x:Name="PlayerNameText" Width="190" Padding="7" Background="#101A29" Foreground="White" BorderBrush="#35445B" Text="Player"/>
+       <TextBlock Text="内存(MB)" VerticalAlignment="Center" Margin="12,4,4,4"/>
+       <ComboBox x:Name="MemoryCombo" Width="110" SelectedIndex="2" Padding="5" Background="#101A29" Foreground="#111">
+        <ComboBoxItem Content="1024"/><ComboBoxItem Content="2048"/><ComboBoxItem Content="4096"/><ComboBoxItem Content="6144"/><ComboBoxItem Content="8192"/>
+       </ComboBox>
+      </WrapPanel>
+      <WrapPanel>
+       <Button Content="检测 Java" Click="DetectJava_Click" Background="#35445B"/>
+       <Button x:Name="LaunchButton" Content="启动所选版本" Click="Launch_Click" IsEnabled="False" ToolTip="安装完成并选择正版账号或离线本地账户后启用。"/>
+      </WrapPanel>
+     </StackPanel>
+    </Border>
+    <Border Background="{StaticResource Panel}" CornerRadius="14" Padding="20" Margin="0,16,0,0">
+     <StackPanel>
+      <TextBlock Text="版本安装中心" FontSize="20" FontWeight="SemiBold"/>
+      <TextBlock Text="获取 Mojang 官方版本清单，选择版本并安装 Vanilla 游戏文件。首次安装需要网络；文件完整安装后，可使用微软正版账号或离线本地账户启动单人游戏。" TextWrapping="Wrap" Foreground="#B9C7D9" Margin="0,7,0,10"/>
+      <WrapPanel>
+       <Button Content="获取官方版本列表" Click="LoadVersions_Click"/>
+       <Button Content="安装所选版本" Click="InstallSelected_Click"/>
+       <Button Content="选择游戏目录" Click="ChooseDirectory_Click" Background="#35445B"/>
+      </WrapPanel>
+      <TextBlock Text="游戏目录" Foreground="#AAB8CC" Margin="4,8,4,2"/>
+      <TextBox x:Name="GameDirectoryText" Padding="8" Background="#101A29" Foreground="White" BorderBrush="#35445B"/>
+      <TextBlock x:Name="StatusText" Text="状态：等待操作" Margin="4,12,4,8" Foreground="#A9C9FF" TextWrapping="Wrap"/>
+      <ProgressBar x:Name="Progress" Height="12" Minimum="0" Maximum="100" Margin="4,4,4,8"/>
+      <ListView x:Name="VersionsList" Height="260" Background="#101A29" Foreground="#F1F5FC" BorderThickness="0">
+       <ListView.View><GridView>
+        <GridViewColumn Header="版本" DisplayMemberBinding="{Binding Id}" Width="150"/>
+        <GridViewColumn Header="类型" DisplayMemberBinding="{Binding Type}" Width="100"/>
+        <GridViewColumn Header="发布时间 (UTC)" DisplayMemberBinding="{Binding ReleaseTime}" Width="220"/>
+       </GridView></ListView.View>
+      </ListView>
+     </StackPanel>
+    </Border>
+    <Border Background="{StaticResource Panel}" CornerRadius="14" Padding="20" Margin="0,16,0,0">
+     <StackPanel>
+      <TextBlock Text="运行日志" FontSize="18" FontWeight="SemiBold"/>
+      <TextBox x:Name="LogText" Height="120" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Background="#101A29" Foreground="#C5D2E4" BorderThickness="0" Margin="0,10,0,0"/>
+     </StackPanel>
+    </Border>
+   </StackPanel>
+  </ScrollViewer>
+ </Grid>
+</Window>
