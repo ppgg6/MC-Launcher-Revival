@@ -15,6 +15,8 @@ public partial class MainWindow : Window
 {
     private const string ManifestUrl = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(5) };
+    private static readonly SemaphoreSlim DownloadSlots = new(8, 8);
+    private int _assetDone;
     private List<VersionRow> _versions = new();
     private string _gameDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), ".minecraft");
     private readonly HashSet<string> _downloadedAssets = new(StringComparer.OrdinalIgnoreCase);
@@ -26,7 +28,7 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         GameDirectoryText.Text = _gameDir;
-        Log("MC Launcher Revival 1.2 初始化。");
+        Log("MC Launcher Revival 3.0 开发版初始化：PCL2 风格界面、并发下载、Java 管理与模组管理。");
         Log("启动器已初始化。请先配置 Microsoft OAuth Client ID，登录正版账号后启动游戏。");
     }
 
@@ -87,6 +89,41 @@ public partial class MainWindow : Window
             catch { }
         }
         SetStatus("未找到 Java。请安装适配 Minecraft 版本的 Java，并配置 PATH 或 JAVA_HOME。");
+    }
+
+
+    private async void InstallJava_Click(object sender, RoutedEventArgs e)
+    {
+        var answer = MessageBox.Show("将从 Eclipse Adoptium 官方 API 下载并安装 Temurin Java 21（Windows x64）。是否继续？", "自动安装 Java 21", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (answer != MessageBoxResult.Yes) return;
+        try
+        {
+            string javaRoot = Path.Combine(_gameDir, "runtime");
+            string installDir = Path.Combine(javaRoot, "temurin-21");
+            Directory.CreateDirectory(javaRoot);
+            SetStatus("正在查询 Adoptium 官方 Java 21 下载包……");
+            Log("开始下载 Eclipse Temurin Java 21。");
+            string api = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse";
+            string archive = Path.Combine(javaRoot, "temurin-21.zip");
+            using (var response = await Http.GetAsync(api, HttpCompletionOption.ResponseHeadersRead))
+            {
+                response.EnsureSuccessStatusCode();
+                await using var input = await response.Content.ReadAsStreamAsync();
+                await using var output = new FileStream(archive, FileMode.Create, FileAccess.Write, FileShare.None, 131072, true);
+                await input.CopyToAsync(output);
+            }
+            SetStatus("下载完成，正在解压 Java 运行环境……");
+            if (Directory.Exists(installDir)) Directory.Delete(installDir, true);
+            Directory.CreateDirectory(installDir);
+            ZipFile.ExtractToDirectory(archive, installDir, true);
+            File.Delete(archive);
+            string? javaExe = Directory.GetFiles(installDir, "java.exe", SearchOption.AllDirectories).FirstOrDefault(x => x.Replace('\\','/').Contains("/bin/java.exe", StringComparison.OrdinalIgnoreCase));
+            if (javaExe == null) throw new FileNotFoundException("压缩包中没有找到 bin/java.exe。");
+            _javaPath = javaExe;
+            SetStatus("Java 21 安装完成：" + javaExe);
+            Log("Java 21 安装完成：" + javaExe);
+        }
+        catch (Exception ex) { SetStatus("Java 自动安装失败：" + ex.Message); Log("Java 安装错误：" + ex); MessageBox.Show(ex.Message, "Java 安装失败"); }
     }
 
     private void ChooseDirectory_Click(object sender, RoutedEventArgs e)
@@ -157,39 +194,27 @@ public partial class MainWindow : Window
     {
         if (!meta.TryGetProperty("libraries", out var libs)) return;
         var list = libs.EnumerateArray().ToList();
-        int done = 0;
+        var jobs = new List<Task>();
         foreach (var lib in list)
         {
-            done++;
-            try
+            if (!IsAllowed(lib) || !lib.TryGetProperty("downloads", out var downloads)) continue;
+            if (downloads.TryGetProperty("artifact", out var artifact)) AddArtifactJob(artifact);
+            if (downloads.TryGetProperty("classifiers", out var classifiers))
             {
-                if (!IsAllowed(lib)) continue;
-                if (!lib.TryGetProperty("downloads", out var downloads)) continue;
-                if (downloads.TryGetProperty("artifact", out var artifact))
-                {
-                    var path = ResolveLibraryPath(artifact);
-                    var url = artifact.GetProperty("url").GetString();
-                    if (!string.IsNullOrWhiteSpace(path) && !string.IsNullOrWhiteSpace(url))
-                        await DownloadAndVerifyAsync(url!, path!, artifact.TryGetProperty("sha1", out var sha) ? sha.GetString() : null,
-                            artifact.TryGetProperty("size", out var size) ? size.GetInt64() : null);
-                }
-                if (downloads.TryGetProperty("classifiers", out var classifiers))
-                {
-                    var nativeKey = FindNativeClassifier(lib);
-                    if (nativeKey != null && classifiers.TryGetProperty(nativeKey, out var native))
-                    {
-                        var path = ResolveLibraryPath(native);
-                        var url = native.GetProperty("url").GetString();
-                        if (!string.IsNullOrWhiteSpace(path) && !string.IsNullOrWhiteSpace(url))
-                            await DownloadAndVerifyAsync(url!, path!, native.TryGetProperty("sha1", out var sha) ? sha.GetString() : null,
-                                native.TryGetProperty("size", out var size) ? size.GetInt64() : null);
-                    }
-                }
+                var nativeKey = FindNativeClassifier(lib);
+                if (nativeKey != null && classifiers.TryGetProperty(nativeKey, out var native)) AddArtifactJob(native);
             }
-            catch (Exception ex) { throw new InvalidDataException($"依赖库下载失败（{done}/{list.Count}）：{ex.Message}", ex); }
-            if (list.Count > 0) Progress.Value = 20 + 40.0 * done / list.Count;
         }
-        Log($"依赖库处理完成（尝试 {list.Count} 项）。");
+        await Task.WhenAll(jobs);
+        Log($"依赖库并发处理完成：{jobs.Count} 个文件任务。");
+        void AddArtifactJob(JsonElement artifact)
+        {
+            var path = ResolveLibraryPath(artifact);
+            var url = artifact.TryGetProperty("url", out var u) ? u.GetString() : null;
+            if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(url)) return;
+            jobs.Add(DownloadAndVerifyAsync(url!, path!, artifact.TryGetProperty("sha1", out var sh) ? sh.GetString() : null,
+                artifact.TryGetProperty("size", out var sz) ? sz.GetInt64() : null));
+        }
     }
 
     private bool IsAllowed(JsonElement lib)
@@ -232,24 +257,25 @@ public partial class MainWindow : Window
         using var indexDoc = JsonDocument.Parse(await File.ReadAllBytesAsync(indexPath));
         if (!indexDoc.RootElement.TryGetProperty("objects", out var objects)) return;
         var entries = objects.EnumerateObject().ToList();
-        int count = 0;
-        foreach (var obj in entries)
+        int done = 0;
+        await Parallel.ForEachAsync(entries, new ParallelOptions { MaxDegreeOfParallelism = 8 }, async (obj, ct) =>
         {
-            try
+            var hash = obj.Value.GetProperty("hash").GetString();
+            if (!string.IsNullOrWhiteSpace(hash) && hash.Length >= 2)
             {
-                var hash = obj.Value.GetProperty("hash").GetString();
-                if (string.IsNullOrWhiteSpace(hash) || hash.Length < 2) continue;
                 var assetPath = Path.Combine(_gameDir, "assets", "objects", hash[..2], hash);
                 var assetUrl = $"https://resources.download.minecraft.net/{hash[..2]}/{hash}";
                 await DownloadAndVerifyAsync(assetUrl, assetPath, hash,
                     obj.Value.TryGetProperty("size", out var sz) ? sz.GetInt64() : null);
             }
-            catch (Exception ex) { throw new InvalidDataException($"资源文件下载失败（{count + 1}/{entries.Count}）：{ex.Message}", ex); }
-            count++;
-            if (count % 50 == 0) Log($"资源下载进度：{count}/{entries.Count}");
-            if (entries.Count > 0) Progress.Value = 60 + 39.0 * count / entries.Count;
-        }
-        Log($"资源文件处理结束：{count}/{entries.Count}。");
+            int current = Interlocked.Increment(ref done);
+            if (current % 50 == 0 || current == entries.Count)
+            {
+                Dispatcher.Invoke(() => Progress.Value = 60 + 39.0 * current / Math.Max(1, entries.Count));
+                Log($"资源并发下载进度：{current}/{entries.Count}");
+            }
+        });
+        Log($"资源文件并发处理完成：{done}/{entries.Count}。");
     }
 
     private async Task DownloadAndVerifyAsync(string url, string path, string? sha1, long? expectedSize)
@@ -259,27 +285,34 @@ public partial class MainWindow : Window
         {
             var fi = new FileInfo(path);
             if ((!expectedSize.HasValue || fi.Length == expectedSize.Value) &&
-                (string.IsNullOrWhiteSpace(sha1) || await Sha1Async(path) == sha1.ToLowerInvariant()))
-                return;
+                (string.IsNullOrWhiteSpace(sha1) || await Sha1Async(path) == sha1.ToLowerInvariant())) return;
             File.Delete(path);
         }
-
-        using var response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-        response.EnsureSuccessStatusCode();
-        var temp = path + ".part";
+        await DownloadSlots.WaitAsync();
         try
         {
-            await using (var input = await response.Content.ReadAsStreamAsync())
-            await using (var output = File.Create(temp))
-                await input.CopyToAsync(output);
-            var info = new FileInfo(temp);
-            if (expectedSize.HasValue && info.Length != expectedSize.Value)
-                throw new InvalidDataException($"文件大小校验失败：{Path.GetFileName(path)}");
-            if (!string.IsNullOrWhiteSpace(sha1) && await Sha1Async(temp) != sha1.ToLowerInvariant())
-                throw new InvalidDataException($"SHA-1 校验失败：{Path.GetFileName(path)}");
-            File.Move(temp, path, true);
+            string temp = path + ".part";
+            Exception? last = null;
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                try
+                {
+                    using var response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                    response.EnsureSuccessStatusCode();
+                    await using (var input = await response.Content.ReadAsStreamAsync())
+                    await using (var output = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, true))
+                        await input.CopyToAsync(output);
+                    var info = new FileInfo(temp);
+                    if (expectedSize.HasValue && info.Length != expectedSize.Value) throw new InvalidDataException("文件大小校验失败：" + Path.GetFileName(path));
+                    if (!string.IsNullOrWhiteSpace(sha1) && await Sha1Async(temp) != sha1.ToLowerInvariant()) throw new InvalidDataException("SHA-1 校验失败：" + Path.GetFileName(path));
+                    File.Move(temp, path, true);
+                    return;
+                }
+                catch (Exception ex) { last = ex; if (File.Exists(temp)) File.Delete(temp); if (attempt < 3) await Task.Delay(500 * attempt); }
+            }
+            throw new IOException($"下载失败（已重试 3 次）：{Path.GetFileName(path)}", last);
         }
-        finally { if (File.Exists(temp)) File.Delete(temp); }
+        finally { DownloadSlots.Release(); }
     }
 
     private static async Task<string> Sha1Async(string path)
@@ -485,8 +518,40 @@ public partial class MainWindow : Window
     private int GetMemory() => MemoryCombo.SelectedItem is ComboBoxItem item && int.TryParse(item.Content?.ToString(),out int mb) ? mb : 4096;
     private string FindJava(int major)
     {
-        var candidates=new List<string>(); string? home=Environment.GetEnvironmentVariable("JAVA_HOME"); if(!string.IsNullOrWhiteSpace(home)) candidates.Add(Path.Combine(home,"bin","java.exe")); candidates.Add("java.exe");
+        var candidates=new List<string>(); if (!string.IsNullOrWhiteSpace(_javaPath) && File.Exists(_javaPath)) candidates.Add(_javaPath); string? home=Environment.GetEnvironmentVariable("JAVA_HOME"); if(!string.IsNullOrWhiteSpace(home)) candidates.Add(Path.Combine(home,"bin","java.exe")); candidates.Add("java.exe");
         foreach(var candidate in candidates) try { var p=Process.Start(new ProcessStartInfo(candidate,"-version"){RedirectStandardError=true,UseShellExecute=false,CreateNoWindow=true}); if(p==null) continue; string output=p.StandardError.ReadToEnd(); p.WaitForExit(); var m=System.Text.RegularExpressions.Regex.Match(output,@"version ""(?<v>\d+(?:\.\d+)*)"); int found=8; if(m.Success) { var parts=m.Groups["v"].Value.Split('.'); found=parts[0]=="1" && parts.Length>1 ? int.Parse(parts[1]) : int.Parse(parts[0]); } if(found>=major) return candidate; } catch{} throw new FileNotFoundException($"需要 Java {major} 或更高版本，请安装并配置 JAVA_HOME。");
+    }
+
+    private void Mods_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            _gameDir = string.IsNullOrWhiteSpace(GameDirectoryText.Text) ? _gameDir : GameDirectoryText.Text.Trim();
+            string modsDir = Path.Combine(_gameDir, "mods");
+            Directory.CreateDirectory(modsDir);
+            var files = Directory.GetFiles(modsDir).Where(f => f.EndsWith(".jar", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jar.disabled", StringComparison.OrdinalIgnoreCase)).ToList();
+            var window = new Window { Title = "模组管理 · MC Launcher Revival", Width = 650, Height = 500, WindowStartupLocation = WindowStartupLocation.CenterOwner, Owner = this, Background = System.Windows.Media.Brushes.White };
+            var root = new DockPanel { Margin = new Thickness(16) };
+            var info = new TextBlock { Text = "模组目录：" + modsDir + "\n把 Forge / Fabric 模组 .jar 文件放入此目录。双击列表可启用或禁用模组。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0,0,0,12) };
+            DockPanel.SetDock(info, Dock.Top); root.Children.Add(info);
+            var buttons = new WrapPanel { Margin = new Thickness(0,12,0,0) }; DockPanel.SetDock(buttons, Dock.Bottom);
+            var list = new ListBox();
+            void Refresh() { list.Items.Clear(); foreach (var f in Directory.GetFiles(modsDir).Where(f => f.EndsWith(".jar", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jar.disabled", StringComparison.OrdinalIgnoreCase))) list.Items.Add(Path.GetFileName(f)); }
+            list.MouseDoubleClick += (_,__) => { if (list.SelectedItem is string name) { string oldPath = Path.Combine(modsDir,name); string newPath = name.EndsWith(".disabled",StringComparison.OrdinalIgnoreCase) ? oldPath[..^9] : oldPath + ".disabled"; File.Move(oldPath,newPath,true); Refresh(); } };
+            var open = new Button { Content = "打开模组文件夹", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
+            open.Click += (_,__) => Process.Start(new ProcessStartInfo(modsDir) { UseShellExecute = true });
+            var forge = new Button { Content = "Forge 官方下载", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
+            forge.Click += (_,__) => Process.Start(new ProcessStartInfo("https://files.minecraftforge.net/") { UseShellExecute = true });
+            var import = new Button { Content = "导入模组", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
+            import.Click += (_,__) => { var picker = new OpenFileDialog { Filter = "Minecraft 模组 (*.jar)|*.jar", Multiselect = true }; if (picker.ShowDialog() == true) { foreach (var f in picker.FileNames) { string dest = Path.Combine(modsDir, Path.GetFileName(f)); File.Copy(f, dest, true); } Refresh(); } };
+            var remove = new Button { Content = "删除选中模组", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
+            remove.Click += (_,__) => { if (list.SelectedItem is string name) { File.Delete(Path.Combine(modsDir, name)); Refresh(); } };
+            var fabric = new Button { Content = "Fabric 官方下载", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
+            fabric.Click += (_,__) => Process.Start(new ProcessStartInfo("https://fabricmc.net/use/installer/") { UseShellExecute = true });
+            buttons.Children.Add(open); buttons.Children.Add(import); buttons.Children.Add(remove); buttons.Children.Add(forge); buttons.Children.Add(fabric);
+            root.Children.Add(buttons); root.Children.Add(list); window.Content = root; Refresh(); window.ShowDialog();
+        }
+        catch (Exception ex) { MessageBox.Show("打开模组管理失败：" + ex.Message); }
     }
 
     private void Settings_Click(object sender, RoutedEventArgs e)
