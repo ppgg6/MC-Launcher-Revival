@@ -19,7 +19,7 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 ## 注意
 - Modrinth 搜索和下载需要联网；本功能只安装 Modrinth 的 `mod` 项目，不把资源包、光影包当作模组。
 - 模组下载目前为单个发布文件安装；模组依赖需要用户按项目说明补齐，下载目标是当前 Minecraft 游戏目录的共享 `mods` 文件夹。
-- 本项目需要在 Windows x64 上使用 .NET 8 SDK 编译。源码包尚未由当前环境进行 Windows 编译或实际 Minecraft 启动测试。
+- 本项目需要在 Windows x64 上使用 .NET 8 SDK 编译。GitHub Actions 已完成 Windows 编译并产出 artifact，但尚未在 Windows 实机上进行 Minecraft 启动测试。
 
 
 ## v3.5 Java 下载优化
@@ -31,13 +31,18 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - 说明：实际速度仍受网络、下载服务器限速和电脑带宽影响；并非所有服务器都支持分段下载。
 
 
-## v3.6 Lite（小体积版）
+## 体积与运行环境
 
-- 改为 .NET 8 framework-dependent 单文件发布，启动器本体不再捆绑 .NET/WPF 运行时，以显著减小体积。
-- GitHub Actions 会检查整个发布目录是否不超过 10 MB；超过则构建失败，不会把超限包冒充为合格版本。
-- **运行前提：** Windows x64 电脑需要安装 .NET 8 Desktop Runtime（桌面运行时）。这部分运行环境不包含在启动器内，因此安装后启动器体积更小。
+- 当前发布方式为 **self-contained 单文件**（`--self-contained true`）：启动器自带 .NET / WPF 运行时，用户下载后**双击即可运行，不需要预先安装 .NET 8 Desktop Runtime**。
+- 代价是体积较大：GitHub Actions 产出的 win-x64 artifact 压缩后约 64 MB。
 - Java 仍由启动器按需下载，不包含在启动器安装包中。
-- 注意：本源码包已生成，但需要 GitHub Actions 实际发布后才能确认最终发布目录体积及启动情况。
+- 构建状态：GitHub Actions 已能在 `windows-latest` 上成功编译并产出 artifact（2026-11-04 实测通过），但尚未在 Windows 实机上进行 Minecraft 启动测试。
+
+### 如果以后想改成小体积分发
+
+- 把 `.github/workflows/build-windows.yml` 里的 `--self-contained true` 改成 `false`（framework-dependent 单文件，体积可降到几 MB）。
+- **必须同时**把本节改成「Windows x64 需要安装 .NET 8 Desktop Runtime」，否则文档会与实际产物不符，用户会按错误的说明操作。
+- 也可以给工作流加一步「发布目录不超过 N MB 否则构建失败」的检查，避免超限包被当成合格版本发布。
 
 
 
