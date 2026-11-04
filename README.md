@@ -1,4 +1,4 @@
-# X Launcher v4.0.0-preview2 开发版
+# X Launcher v4.0.0-preview3 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -63,3 +63,15 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - GitHub Actions 与 README 对齐：framework-dependent 单文件发布 + 10 MB 体积闸门。
 
 > 本版本仍为源码开发预览，未在 Windows 实机上完成编译与 Minecraft 启动验证。
+
+
+
+## v4.0.0-preview3 新增：安装游戏时自动准备 Java
+
+- 安装 Minecraft 版本时读取该版本元数据里的 `javaVersion.majorVersion`，自动下载对应主版本的 Eclipse Temurin，并把结果绑定到这个版本（写入 `settings.json` 的 `versionJavaPaths`）。
+- 主页面「版本选择」新增开关「安装时同时下载对应 Java」，默认开启，状态会保存；关掉后仍可在启动时按弹窗提示安装。
+- Adoptium 若没有该主版本的 JRE 包（例如部分新版本），自动改用 JDK 包，不再直接失败。
+- 元数据缺少 `javaVersion` 时按版本号推断：1.20.5+/1.21 → 21，1.18~1.20 → 17，更早 → 8。
+- Java 安装失败不会中断游戏安装：游戏文件保留，界面提示失败原因，日志里记录完整异常。
+
+> Java 运行时约 40 MB，安装阶段状态栏会显示「正在准备 Minecraft x.x 需要的 Java N……」，请耐心等待。

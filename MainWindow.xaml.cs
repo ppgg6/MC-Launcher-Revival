@@ -42,6 +42,9 @@ public partial class MainWindow : Window
         VersionsList.SelectionChanged += (_, __) => UpdateLaunchAvailability();
         Log("X 启动器初始化：独立下载页、启动页、设置页与模组管理。");
         LoadSavedSettings();
+        // Java 自动安装开关改动后立即存盘，下次打开还是上次的选择。
+        AutoJavaCheck.Checked += (_, __) => { try { SaveSettings(); } catch { } };
+        AutoJavaCheck.Unchecked += (_, __) => { try { SaveSettings(); } catch { } };
         CheckInstalledVersions();
         Log("启动器已初始化。请先选择账户，再安装并启动游戏。");
     }
@@ -114,6 +117,20 @@ public partial class MainWindow : Window
         catch (Exception ex) { SetStatus("Java 自动安装失败：" + ex.Message); Log("Java 安装错误：" + ex); MessageBox.Show(ex.Message, "Java 安装失败"); }
     }
 
+    /// <summary>探测 Adoptium 是否提供该包；网络异常时返回 true，交给正式下载流程去重试和报错。</summary>
+    private async Task<bool> AdoptiumHasPackageAsync(string url)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Range = new RangeHeaderValue(0, 0);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+            return response.IsSuccessStatusCode || response.StatusCode == System.Net.HttpStatusCode.PartialContent;
+        }
+        catch { return true; }
+    }
+
     private async Task<string> InstallJavaRuntimeAsync(int major)
     {
         if (major < 8 || major > 99) throw new ArgumentOutOfRangeException(nameof(major));
@@ -124,7 +141,13 @@ public partial class MainWindow : Window
         if (existing != null && IsJavaCompatible(existing, major)) { _javaPath = existing; return existing; }
         SetStatus($"正在查询 Adoptium 官方 Java {major} 下载包……");
         Log($"开始下载 Eclipse Temurin Java {major}。安装目录：{installDir}");
+        // 部分主版本（例如 25）Adoptium 可能只提供 JDK 而没有 JRE，先探测再决定用哪个包。
         string api = $"https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jre/hotspot/normal/eclipse";
+        if (!await AdoptiumHasPackageAsync(api))
+        {
+            api = $"https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jdk/hotspot/normal/eclipse";
+            Log($"Adoptium 没有 Java {major} 的 JRE 包，改用 JDK 包。");
+        }
         string archive = Path.Combine(javaRoot, $"temurin-{major}.zip");
         await DownloadJavaArchiveAsync(api, archive, major);
         if (!File.Exists(archive) || new FileInfo(archive).Length < 1024 * 1024) throw new InvalidDataException("Java 下载包大小异常，已拒绝解压。");
@@ -491,7 +514,7 @@ public partial class MainWindow : Window
         {
             string version = versionPick.Text.Trim(); if (string.IsNullOrWhiteSpace(version)) { MessageBox.Show(win, "请先选择或输入游戏版本号。"); return; }
             if (list.SelectedItem is not JavaEntry entry || !File.Exists(entry.Path)) { MessageBox.Show(win, "请先在上方列表选择有效 Java。"); return; }
-            int required = version.StartsWith("1.20.5", StringComparison.OrdinalIgnoreCase) || version.StartsWith("1.21", StringComparison.OrdinalIgnoreCase) ? 21 : version.StartsWith("1.18", StringComparison.OrdinalIgnoreCase) || version.StartsWith("1.19", StringComparison.OrdinalIgnoreCase) || version.StartsWith("1.20", StringComparison.OrdinalIgnoreCase) ? 17 : 8;
+            int required = GuessJavaMajor(version);
             using (var versionDoc = TryReadVersionMetadata(version))
                 if (versionDoc != null && versionDoc.RootElement.TryGetProperty("javaVersion", out var jv) && jv.TryGetProperty("majorVersion", out var jm)) required = jm.GetInt32();
             if (!IsJavaCompatible(entry.Path, required)) { MessageBox.Show(win, $"该版本元数据要求 Java {required}，当前所选 Java 主版本不匹配。"); return; }
@@ -587,6 +610,8 @@ public partial class MainWindow : Window
             await DownloadLoggingAsync(meta);
             Progress.Value = 60;
             await DownloadAssetsAsync(meta);
+            Progress.Value = 92;
+            if (AutoJavaCheck.IsChecked == true) await EnsureJavaForVersionAsync(meta, selected.Id);
             Progress.Value = 100;
             SetStatus($"版本 {selected.Id} 安装完成。选择正版登录或离线本地账户后即可尝试启动。");
             Log($"安装流程完成：{selected.Id}。已处理依赖、原生库和 logging 配置。");
@@ -597,6 +622,42 @@ public partial class MainWindow : Window
             SetStatus("安装失败：" + ex.Message);
             Log("安装失败：" + ex);
         }
+    }
+
+    /// <summary>安装游戏后，顺带准备该版本元数据要求的 Java，并把结果绑定到版本上。</summary>
+    private async Task EnsureJavaForVersionAsync(JsonElement meta, string version)
+    {
+        int javaMajor = meta.TryGetProperty("javaVersion", out var jv) && jv.TryGetProperty("majorVersion", out var jm)
+            ? jm.GetInt32()
+            : GuessJavaMajor(version);
+        if (_versionJavaPaths.TryGetValue(version, out var bound) && File.Exists(bound) && IsJavaCompatible(bound, javaMajor))
+        {
+            Log($"版本 {version} 已有可用的 Java {javaMajor}：{bound}");
+            return;
+        }
+        try
+        {
+            SetStatus($"正在准备 Minecraft {version} 需要的 Java {javaMajor}……");
+            string javaPath = await InstallJavaRuntimeAsync(javaMajor);
+            _versionJavaPaths[version] = javaPath;
+            SaveSettings();
+            SetStatus($"Java {javaMajor} 已就绪，并绑定到版本 {version}。");
+            Log($"已为版本 {version} 绑定 Java {javaMajor}：{javaPath}");
+        }
+        catch (Exception ex)
+        {
+            // Java 装不上不影响已经下载好的游戏文件，提示用户并继续。
+            SetStatus($"游戏已安装，但 Java {javaMajor} 自动安装失败：{ex.Message}");
+            Log("Java 自动安装失败（游戏文件已保留）：" + ex);
+        }
+    }
+
+    /// <summary>元数据没有 javaVersion 时，按版本号猜一个主版本。</summary>
+    private static int GuessJavaMajor(string version)
+    {
+        if (version.StartsWith("1.20.5", StringComparison.OrdinalIgnoreCase) || version.StartsWith("1.21", StringComparison.OrdinalIgnoreCase)) return 21;
+        if (version.StartsWith("1.18", StringComparison.OrdinalIgnoreCase) || version.StartsWith("1.19", StringComparison.OrdinalIgnoreCase) || version.StartsWith("1.20", StringComparison.OrdinalIgnoreCase)) return 17;
+        return 8;
     }
 
     private async Task DownloadClientAsync(JsonElement meta, string versionDir, string id)
@@ -920,7 +981,7 @@ public partial class MainWindow : Window
             string versionDir = Path.Combine(_gameDir, "versions", selected.Id), jsonPath = Path.Combine(versionDir, selected.Id + ".json"), jarPath = Path.Combine(versionDir, selected.Id + ".jar");
             if (!File.Exists(jsonPath) || !File.Exists(jarPath)) throw new FileNotFoundException("所选版本尚未完整安装，请先安装。 ");
             using var doc = JsonDocument.Parse(await File.ReadAllTextAsync(jsonPath)); var meta = doc.RootElement;
-            int javaMajor = meta.TryGetProperty("javaVersion", out var jv) && jv.TryGetProperty("majorVersion", out var jm) ? jm.GetInt32() : (selected.Id.StartsWith("1.20.5") || selected.Id.StartsWith("1.21") ? 21 : selected.Id.StartsWith("1.18") || selected.Id.StartsWith("1.19") || selected.Id.StartsWith("1.20") ? 17 : 8);
+            int javaMajor = meta.TryGetProperty("javaVersion", out var jv) && jv.TryGetProperty("majorVersion", out var jm) ? jm.GetInt32() : GuessJavaMajor(selected.Id);
             string java;
             try
             {
@@ -1152,8 +1213,8 @@ public partial class MainWindow : Window
     }
 
     private string SettingsPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XLauncher", "settings.json");
-    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("autoCheckInstalled",out var ac)) _autoCheckInstalled=ac.ValueKind==JsonValueKind.True; if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=MemoryIndex(mem.ToString()); if(r.TryGetProperty("versionJavaPaths",out var mappings)&&mappings.ValueKind==JsonValueKind.Object) _versionJavaPaths=mappings.EnumerateObject().Where(x=>x.Value.ValueKind==JsonValueKind.String).ToDictionary(x=>x.Name,x=>x.Value.GetString()!,StringComparer.OrdinalIgnoreCase); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
-    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString(), autoCheckInstalled=_autoCheckInstalled, versionJavaPaths=_versionJavaPaths }, new JsonSerializerOptions { WriteIndented=true })); }
+    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("autoCheckInstalled",out var ac)) _autoCheckInstalled=ac.ValueKind==JsonValueKind.True; if(r.TryGetProperty("autoJavaOnInstall",out var aj)) AutoJavaCheck.IsChecked=aj.ValueKind==JsonValueKind.True; if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=MemoryIndex(mem.ToString()); if(r.TryGetProperty("versionJavaPaths",out var mappings)&&mappings.ValueKind==JsonValueKind.Object) _versionJavaPaths=mappings.EnumerateObject().Where(x=>x.Value.ValueKind==JsonValueKind.String).ToDictionary(x=>x.Name,x=>x.Value.GetString()!,StringComparer.OrdinalIgnoreCase); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
+    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString(), autoCheckInstalled=_autoCheckInstalled, autoJavaOnInstall=AutoJavaCheck.IsChecked==true, versionJavaPaths=_versionJavaPaths }, new JsonSerializerOptions { WriteIndented=true })); }
 
     private void DownloadPage_Click(object sender, RoutedEventArgs e)
     {
