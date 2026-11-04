@@ -892,11 +892,11 @@ public partial class MainWindow : Window
             using var profileResp = await Http.SendAsync(profileRequest);
             using var profile = JsonDocument.Parse(await profileResp.Content.ReadAsStringAsync()); profileResp.EnsureSuccessStatusCode();
             _uuid = profile.RootElement.GetProperty("id").GetString(); _username = profile.RootElement.GetProperty("name").GetString(); _userType = "msa"; _offlineMode = false;
-            PlayerNameText.Text = _username; AccountStatusText.Text = "账号：已登录正版 Java 版 · " + _username;
+            PlayerNameText.Text = _username; AccountStatusText.Text = "已登录正版 · " + _username;
             UpdateLaunchAvailability();
             Log("Microsoft → Xbox Live → XSTS → Minecraft Services 认证成功；已获取 Java Profile。"); SetStatus("正版账号认证成功。");
         }
-        catch (Exception ex) { _accessToken = null; _offlineMode = false; UpdateLaunchAvailability(); AccountStatusText.Text = "账号：登录失败"; SetStatus("认证失败：" + ex.Message); Log("认证失败：" + ex); MessageBox.Show(ex.Message, "登录失败"); }
+        catch (Exception ex) { _accessToken = null; _offlineMode = false; UpdateLaunchAvailability(); AccountStatusText.Text = "登录失败"; SetStatus("认证失败：" + ex.Message); Log("认证失败：" + ex); MessageBox.Show(ex.Message, "登录失败"); }
     }
 
     private void OfflineLogin_Click(object sender, RoutedEventArgs e)
@@ -914,7 +914,7 @@ public partial class MainWindow : Window
         _accessToken = "0"; // Offline sessions are not authenticated by Mojang/Microsoft.
         _userType = "legacy";
         _offlineMode = true;
-        AccountStatusText.Text = "账号：离线本地账户 · " + name + "（未验证正版身份）";
+        AccountStatusText.Text = "离线账户 · " + name + "（未验证）";
         UpdateLaunchAvailability();
         Log($"已切换到离线本地账户：{name}；该身份不具备正版服务器认证。UUID={_uuid}");
         SetStatus("离线模式已启用。可启动本地已完整安装的版本；正版服务器、Realms 等服务不可用。");
@@ -923,7 +923,7 @@ public partial class MainWindow : Window
     private void Logout_Click(object sender, RoutedEventArgs e)
     {
         _accessToken = null; _uuid = null; _username = null; _userType = null; _offlineMode = false;
-        AccountStatusText.Text = "账号：未登录";
+        AccountStatusText.Text = "未登录";
         UpdateLaunchAvailability();
         SetStatus("已退出当前账户。请选择微软正版登录或离线本地账户。");
     }

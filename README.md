@@ -1,4 +1,4 @@
-# X Launcher v4.0.0-preview3 开发版
+# X Launcher v4.0.0-preview4 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -75,3 +75,12 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - Java 安装失败不会中断游戏安装：游戏文件保留，界面提示失败原因，日志里记录完整异常。
 
 > Java 运行时约 40 MB，安装阶段状态栏会显示「正在准备 Minecraft x.x 需要的 Java N……」，请耐心等待。
+
+
+
+## v4.0.0-preview4：主界面精简
+
+- 首页只保留「启动 / 版本 / 账户」三块，一屏放得下；Java 手选、游戏目录、日志收进「更多设置」折叠区。
+- 状态文字与进度条移到底部常驻状态栏，下载和安装过程不会再「看不到进度」。
+- 统一按钮、输入框、卡片的圆角与留白，侧栏去掉花哨图标，改成纯文字导航。
+- 账户状态文案统一（正版 / 离线 / 未登录）。
