@@ -1,4 +1,4 @@
-# X Launcher v3.5 开发版
+# X Launcher v4.0.0-preview2 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -38,3 +38,23 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - **运行前提：** Windows x64 电脑需要安装 .NET 8 Desktop Runtime（桌面运行时）。这部分运行环境不包含在启动器内，因此安装后启动器体积更小。
 - Java 仍由启动器按需下载，不包含在启动器安装包中。
 - 注意：本源码包已生成，但需要 GitHub Actions 实际发布后才能确认最终发布目录体积及启动情况。
+
+
+
+## v4.0.0-preview2 修复
+
+- Java 续传：HTTP 416 且本地 `.part` 长度已等于服务器总长度时，直接复用而不重下。
+- Java 续传：`Content-Range` 缺失时不再误判为「起点不一致」并删除有效的续传文件。
+- Java 续传：返回的续传起点与本地长度不一致时才重置；416 分支不再重复 Dispose 响应。
+- 启动前清理上一批残留的 `.segN` 分段文件，避免把不同批次的片段拼在一起。
+- 内存设置：12288 / 16384 保存后不会在重启时被截断成 8192；未知值回落到 4096 而不是 1024。
+- 版本列表：`SelectionChanged` 改为在构造函数里只订阅一次，刷新清单不再叠加回调。
+- 模组管理：删除模组前增加二次确认。
+- 启动器设置：「启动时自动检查已安装版本」现在真的会生效，并写入 `settings.json`。
+- 选择游戏目录改用 .NET 8 自带的 `OpenFolderDialog`，不再借用保存文件对话框。
+- 新增全局异常处理：未处理异常写入 `%AppData%/XLauncher/logs/launcher-yyyyMMdd.log` 并提示用户，不再静默闪退。
+- 老版本启动参数：`minecraftArguments` 已有的 flag 不再重复追加。
+- 库文件架构判断改用进程位数（`Is64BitProcess`）。
+- GitHub Actions 与 README 对齐：framework-dependent 单文件发布 + 10 MB 体积闸门。
+
+> 本版本仍为源码开发预览，未在 Windows 实机上完成编译与 Minecraft 启动验证。

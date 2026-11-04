@@ -25,10 +25,10 @@ public partial class MainWindow : Window
         ConnectTimeout = TimeSpan.FromSeconds(30)
     }) { Timeout = Timeout.InfiniteTimeSpan };
     private static readonly SemaphoreSlim DownloadSlots = new(8, 8);
-    private int _assetDone;
     private List<VersionRow> _versions = new();
+    private static readonly int[] MemoryOptions = { 1024, 2048, 4096, 6144, 8192, 12288, 16384 };
+    private bool _autoCheckInstalled = true;
     private string _gameDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), ".minecraft");
-    private readonly HashSet<string> _downloadedAssets = new(StringComparer.OrdinalIgnoreCase);
     private string? _accessToken, _uuid, _username, _userType;
     private bool _offlineMode;
     private string? _javaPath;
@@ -38,13 +38,17 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         GameDirectoryText.Text = _gameDir;
+        // 只在这里订阅一次；以前写在 LoadVersionsAsync 里，每刷新一次清单就多挂一个回调。
+        VersionsList.SelectionChanged += (_, __) => UpdateLaunchAvailability();
         Log("X 启动器初始化：独立下载页、启动页、设置页与模组管理。");
         LoadSavedSettings();
+        CheckInstalledVersions();
         Log("启动器已初始化。请先选择账户，再安装并启动游戏。");
     }
 
     private void Log(string text)
     {
+        App.WriteLogLine(text);
         Dispatcher.Invoke(() =>
         {
             LogText.AppendText($"[{DateTime.Now:HH:mm:ss}] {text}{Environment.NewLine}");
@@ -69,7 +73,6 @@ public partial class MainWindow : Window
                 (x.GetProperty("releaseTime").GetString() ?? "").Replace("T", " ").Replace("Z", ""),
                 x.GetProperty("url").GetString() ?? "")).ToList();
             VersionsList.ItemsSource = _versions;
-            VersionsList.SelectionChanged += (_, __) => UpdateLaunchAvailability();
             SetStatus($"成功获取 {_versions.Count} 个官方版本。");
             Log($"版本清单已加载：{_versions.Count} 个版本。");
         }
@@ -169,14 +172,17 @@ public partial class MainWindow : Window
                 // HTTP 416 表示请求的 Range 超出服务器文件长度：旧 .part 不能继续追加。
                 if (response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
-                    response.Dispose();
+                    long? serverTotal = TryReadRangeTotal(response);
+                    // 本地 .part 已经等于服务器文件总长度，说明上次其实已经下完（例如写完文件但没来得及改名），直接复用。
+                    if (serverTotal.HasValue && File.Exists(partial) && new FileInfo(partial).Length == serverTotal.Value && TryFinalizeArchive(partial, archive, major))
+                        return;
                     if (File.Exists(partial)) File.Delete(partial);
                     throw new IOException("服务器返回 HTTP 416，已删除无效续传文件；下一次将从头下载。");
                 }
                 bool append = offset > 0 && response.StatusCode == System.Net.HttpStatusCode.PartialContent;
-                if (append && response.Content.Headers.ContentRange?.From != offset)
+                // 注意：ContentRange 缺失时不能直接比较（null != offset 恒为 true，会误删一个完好的续传文件）。
+                if (append && response.Content.Headers.ContentRange is { From: long rangeFrom } && rangeFrom != offset)
                 {
-                    response.Dispose();
                     if (File.Exists(partial)) File.Delete(partial);
                     throw new IOException("服务器返回的续传起始位置与本地文件长度不一致，已重置下载。");
                 }
@@ -217,12 +223,7 @@ public partial class MainWindow : Window
                     throw new IOException($"下载长度不完整：已收到 {new FileInfo(partial).Length} 字节，预期 {totalBytes.Value} 字节。将尝试续传。");
 
                 // 先完整打开 ZIP，避免损坏包进入安装目录。
-                using (var zip = ZipFile.OpenRead(partial))
-                {
-                    if (zip.Entries.Count == 0) throw new InvalidDataException("Java 压缩包为空。");
-                }
-                File.Move(partial, archive, true);
-                Log($"Java {major} 下载完成，文件大小：{new FileInfo(archive).Length / 1048576d:F1} MB。");
+                if (!TryFinalizeArchive(partial, archive, major)) throw new InvalidDataException("Java 下载包校验失败（压缩包为空或无法改名）。");
                 return;
             }
             catch (Exception ex)
@@ -237,6 +238,38 @@ public partial class MainWindow : Window
             }
         }
         throw new IOException($"Java {major} 下载连续失败 {maxAttempts} 次。已保留临时下载文件（如果服务器支持 Range，下次可续传）。最后错误：{lastError?.Message}", lastError);
+    }
+
+    /// <summary>读取 416 响应里的文件总长度（形如 Content-Range: bytes */1234）。</summary>
+    private static long? TryReadRangeTotal(HttpResponseMessage response)
+    {
+        var range = response.Content.Headers.ContentRange;
+        if (range?.HasLength == true) return range.Length;
+        if (!response.Content.Headers.TryGetValues("Content-Range", out var values)) return null;
+        string? raw = values.FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        int slash = raw.LastIndexOf('/');
+        return slash > 0 && long.TryParse(raw[(slash + 1)..].Trim(), out long total) ? total : null;
+    }
+
+    /// <summary>校验下载完成的 ZIP 并将其改名为最终文件；失败返回 false，不抛异常。</summary>
+    private bool TryFinalizeArchive(string partial, string archive, int major)
+    {
+        try
+        {
+            using (var zip = ZipFile.OpenRead(partial))
+            {
+                if (zip.Entries.Count == 0) return false;
+            }
+            File.Move(partial, archive, true);
+            Log($"Java {major} 下载完成，文件大小：{new FileInfo(archive).Length / 1048576d:F1} MB。");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log($"Java {major} 下载包校验失败：{ex.Message}");
+            return false;
+        }
     }
 
     private async Task<bool> TryDownloadJavaInParallelAsync(string url, string partial, int major)
@@ -337,6 +370,7 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             Log($"Java {major} 分段加速下载不可用，切换为断点续传模式：{ex.Message}");
+            // 这里的 partial 是多段合并到一半的产物，不能当作可续传的前缀，必须丢掉后从头下。
             if (File.Exists(partial)) File.Delete(partial);
             return false;
         }
@@ -512,12 +546,15 @@ public partial class MainWindow : Window
 
     private void ChooseDirectory_Click(object sender, RoutedEventArgs e)
     {
-        // FolderBrowserDialog would require WinForms; use a simple path prompt for dependency-free WPF.
-        var dialog = new Microsoft.Win32.SaveFileDialog { Title = "选择游戏目录：在文件名处输入目录名并保存", FileName = "选择目录", Filter = "目录选择提示|*.folder" };
-        if (dialog.ShowDialog() == true)
+        // .NET 8 起 WPF 自带 OpenFolderDialog，不再需要用 SaveFileDialog 变通。
+        var dialog = new Microsoft.Win32.OpenFolderDialog { Title = "选择 Minecraft 游戏目录", Multiselect = false };
+        if (Directory.Exists(_gameDir)) dialog.InitialDirectory = _gameDir;
+        if (dialog.ShowDialog(this) == true && !string.IsNullOrWhiteSpace(dialog.FolderName))
         {
-            _gameDir = Path.GetDirectoryName(dialog.FileName) ?? _gameDir;
+            _gameDir = dialog.FolderName;
             GameDirectoryText.Text = _gameDir;
+            SaveSettings();
+            Log("游戏目录已切换：" + _gameDir);
         }
     }
 
@@ -612,7 +649,7 @@ public partial class MainWindow : Window
             {
                 if (os.TryGetProperty("name", out var name) && name.GetString() != "windows") match = false;
                 if (os.TryGetProperty("arch", out var arch) && arch.GetString() is string a &&
-                    !(Environment.Is64BitOperatingSystem ? (a == "x86_64" || a == "amd64" || a == "x64") : (a == "x86" || a == "i386"))) match = false;
+                    !(Environment.Is64BitProcess ? (a == "x86_64" || a == "amd64" || a == "x64") : (a == "x86" || a == "i386"))) match = false;
                 if (os.TryGetProperty("version", out var ver) && ver.GetString() is string pattern &&
                     !System.Text.RegularExpressions.Regex.IsMatch(Environment.OSVersion.Version.ToString(), pattern)) match = false;
             }
@@ -625,7 +662,7 @@ public partial class MainWindow : Window
     private string? FindNativeClassifier(JsonElement lib)
     {
         if (!lib.TryGetProperty("natives", out var natives) || !natives.TryGetProperty("windows", out var win)) return null;
-        var key = win.GetString()?.Replace("${arch}", Environment.Is64BitOperatingSystem ? "64" : "32");
+        var key = win.GetString()?.Replace("${arch}", Environment.Is64BitProcess ? "64" : "32");
         return key;
     }
 
@@ -849,6 +886,24 @@ public partial class MainWindow : Window
         LaunchButton.IsEnabled = hasIdentity && hasVersion;
     }
 
+    /// <summary>启动时按设置检查已安装版本，只记日志，不改动版本列表。</summary>
+    private void CheckInstalledVersions()
+    {
+        if (!_autoCheckInstalled) { Log("已跳过启动时的已安装版本检查（可在设置中重新开启）。"); return; }
+        try
+        {
+            var versionsDir = Path.Combine(_gameDir, "versions");
+            if (!Directory.Exists(versionsDir)) { Log("启动检查：游戏目录里还没有 versions 子目录。"); return; }
+            int count = Directory.GetDirectories(versionsDir).Count(dir =>
+            {
+                string id = Path.GetFileName(dir);
+                return File.Exists(Path.Combine(dir, id + ".jar")) && File.Exists(Path.Combine(dir, id + ".json"));
+            });
+            Log($"启动检查：游戏目录中已完整安装 {count} 个版本。");
+        }
+        catch (Exception ex) { Log("启动检查失败：" + ex.Message); }
+    }
+
     private async Task<JsonElement> PostJsonAsync(string url, object body)
     {
         string json = System.Text.Json.JsonSerializer.Serialize(body, new JsonSerializerOptions { PropertyNamingPolicy = null });
@@ -892,7 +947,27 @@ public partial class MainWindow : Window
             var vars = new Dictionary<string,string> { ["${natives_directory}"]=natives, ["${launcher_name}"]="MCLauncherRevival", ["${launcher_version}"]="1.2", ["${classpath}"]=string.Join(Path.PathSeparator,cp), ["${classpath_separator}"]=Path.PathSeparator.ToString(), ["${library_directory}"]=Path.Combine(_gameDir,"libraries"), ["${auth_player_name}"]=_username, ["${version_name}"]=selected.Id, ["${game_directory}"]=_gameDir, ["${assets_root}"]=Path.Combine(_gameDir,"assets"), ["${assets_index_name}"]=assetIndex, ["${auth_uuid}"]=_uuid, ["${auth_access_token}"]=_accessToken!, ["${user_type}"]=_userType ?? "legacy", ["${version_type}"]=meta.TryGetProperty("type",out var typ)?typ.GetString()!:"release", ["${user_properties}"]="{}", ["${clientid}"]="", ["${auth_xuid}"]="", ["${auth_session}"]=_accessToken!, ["${game_assets}"]=Path.Combine(_gameDir,"assets","virtual","legacy"), ["${resolution_width}"]="854", ["${resolution_height}"]="480" };
             var args = new List<string>();
             if (meta.TryGetProperty("arguments", out var arguments)) { args.Add("-Xmx"+GetMemory()+"M"); args.Add("-Djava.library.path="+natives); AddArguments(arguments,"jvm",args,vars); if(meta.TryGetProperty("mainClass",out var mc)) args.Add(mc.GetString()!); AddArguments(arguments,"game",args,vars); }
-            else { args.Add("-Djava.library.path="+natives); args.Add("-cp"); args.Add(vars["${classpath}"]); args.Add("-Xmx"+GetMemory()+"M"); args.Add("net.minecraft.client.main.Main"); string legacy = meta.TryGetProperty("minecraftArguments",out var ma)?ma.GetString()??"":""; args.AddRange(legacy.Split(' ',StringSplitOptions.RemoveEmptyEntries).Select(x=>ReplaceVars(x,vars))); args.Add("--version"); args.Add(selected.Id); args.Add("--gameDir"); args.Add(_gameDir); args.Add("--assetsDir"); args.Add(Path.Combine(_gameDir,"assets")); args.Add("--assetIndex"); args.Add(assetIndex); args.Add("--uuid"); args.Add(_uuid); args.Add("--accessToken"); args.Add(_accessToken!); args.Add("--userType"); args.Add(_userType ?? "legacy"); args.Add("--username"); args.Add(_username); }
+            else
+            {
+                args.Add("-Djava.library.path=" + natives); args.Add("-cp"); args.Add(vars["${classpath}"]); args.Add("-Xmx" + GetMemory() + "M");
+                args.Add("net.minecraft.client.main.Main");
+                string legacy = meta.TryGetProperty("minecraftArguments", out var ma) ? ma.GetString() ?? "" : "";
+                args.AddRange(legacy.Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(x => ReplaceVars(x, vars)));
+                // minecraftArguments 通常已经包含这些参数，只在缺失时补齐，避免同一 flag 出现两次。
+                void AddIfMissing(string flag, string value)
+                {
+                    if (args.Contains(flag)) return;
+                    args.Add(flag); args.Add(value);
+                }
+                AddIfMissing("--version", selected.Id);
+                AddIfMissing("--gameDir", _gameDir);
+                AddIfMissing("--assetsDir", Path.Combine(_gameDir, "assets"));
+                AddIfMissing("--assetIndex", assetIndex);
+                AddIfMissing("--uuid", _uuid);
+                AddIfMissing("--accessToken", _accessToken!);
+                AddIfMissing("--userType", _userType ?? "legacy");
+                AddIfMissing("--username", _username);
+            }
             if (meta.TryGetProperty("logging",out var logging) && logging.TryGetProperty("client",out var lc) && lc.TryGetProperty("argument",out var la)) { string cfg=Path.Combine(_gameDir,"assets","log_configs",lc.GetProperty("file").GetProperty("id").GetString()??""); if(File.Exists(cfg)) args.Insert(0,ReplaceVars(la.GetString()??"",new Dictionary<string,string>{{"${path}",cfg}})); }
             var psi = new ProcessStartInfo(java) { WorkingDirectory=_gameDir, UseShellExecute=false };
             foreach(var a in args) psi.ArgumentList.Add(a);
@@ -918,7 +993,15 @@ public partial class MainWindow : Window
         if(!item.TryGetProperty("rules",out var rules)) return true; bool allow=false;
         foreach(var rule in rules.EnumerateArray()) { bool match=true; if(rule.TryGetProperty("os",out var os)&&os.TryGetProperty("name",out var n)&&n.GetString()!="windows") match=false; if(rule.TryGetProperty("features",out var f)&&f.EnumerateObject().Any()) match=false; if(match) allow=rule.TryGetProperty("action",out var a)&&a.GetString()=="allow"; } return allow;
     }
-    private int GetMemory() => MemoryCombo.SelectedItem is ComboBoxItem item && int.TryParse(item.Content?.ToString(),out int mb) ? mb : 4096;
+    private int GetMemory() => MemoryCombo.SelectedItem is ComboBoxItem item && int.TryParse(item.Content?.ToString(),out int mb) ? mb : MemoryOptions[2];
+
+    /// <summary>把内存值映射成下拉框下标；未知值回落到默认 4096，不再被 Math.Clamp 截成 1024/8192。</summary>
+    private static int MemoryIndex(string? text)
+    {
+        int mb = int.TryParse(text, out int parsed) ? parsed : MemoryOptions[2];
+        int index = Array.IndexOf(MemoryOptions, mb);
+        return index >= 0 ? index : 2;
+    }
     private string FindJava(int major)
     {
         var candidates = new List<string>();
@@ -963,7 +1046,13 @@ public partial class MainWindow : Window
             var import = new Button { Content = "导入模组", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
             import.Click += (_,__) => { var picker = new OpenFileDialog { Filter = "Minecraft 模组 (*.jar)|*.jar", Multiselect = true }; if (picker.ShowDialog() == true) { foreach (var f in picker.FileNames) { string dest = Path.Combine(modsDir, Path.GetFileName(f)); File.Copy(f, dest, true); } Refresh(); } };
             var remove = new Button { Content = "删除选中模组", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
-            remove.Click += (_,__) => { if (list.SelectedItem is string name) { File.Delete(Path.Combine(modsDir, name)); Refresh(); } };
+            remove.Click += (_,__) =>
+            {
+                if (list.SelectedItem is not string name) return;
+                if (MessageBox.Show(window, $"确定删除这个模组文件吗？\n{name}", "确认删除", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+                try { File.Delete(Path.Combine(modsDir, name)); Refresh(); Log("已删除模组：" + name); }
+                catch (Exception ex) { MessageBox.Show(window, "删除失败：" + ex.Message); }
+            };
             var fabric = new Button { Content = "Fabric 官方下载", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
             fabric.Click += (_,__) => Process.Start(new ProcessStartInfo("https://fabricmc.net/use/installer/") { UseShellExecute = true });
             var browse = new Button { Content = "在线搜索 / 下载模组（Modrinth）", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7), Background = System.Windows.Media.Brushes.SteelBlue, Foreground = System.Windows.Media.Brushes.White };
@@ -1006,7 +1095,7 @@ public partial class MainWindow : Window
             try
             {
                 string url = "https://api.modrinth.com/v2/search?query=" + Uri.EscapeDataString(query.Text.Trim()) + "&facets=" + Uri.EscapeDataString("[[\"project_type:mod\"]]") + "&limit=30";
-                using var req = new HttpRequestMessage(HttpMethod.Get, url); req.Headers.UserAgent.ParseAdd("XLauncher/3.4 (https://github.com/ppgg6/MC-Launcher-Revival)");
+                using var req = new HttpRequestMessage(HttpMethod.Get, url); req.Headers.UserAgent.ParseAdd("XLauncher/4.0 (https://github.com/ppgg6/MC-Launcher-Revival)");
                 using var resp = await Http.SendAsync(req); resp.EnsureSuccessStatusCode(); using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
                 hits = doc.RootElement.GetProperty("hits").EnumerateArray().Select(x => new ModrinthHit(x.GetProperty("project_id").GetString() ?? "", x.GetProperty("title").GetString() ?? "", x.GetProperty("description").GetString() ?? "", x.GetProperty("slug").GetString() ?? "", x.GetProperty("downloads").ToString(), x.TryGetProperty("icon_url", out var icon) ? icon.GetString() ?? "" : "")).ToList();
                 results.ItemsSource = hits; status.Text = $"找到 {hits.Count} 个项目。安装时会再次核对版本和加载器。";
@@ -1023,7 +1112,7 @@ public partial class MainWindow : Window
             try
             {
                 string versionsUrl = $"https://api.modrinth.com/v2/project/{Uri.EscapeDataString(hit.ProjectId)}/version?game_versions={Uri.EscapeDataString(JsonSerializer.Serialize(new[] { mc.Text.Trim() }))}&loaders={Uri.EscapeDataString(JsonSerializer.Serialize(new[] { loaderName }))}";
-                using var req = new HttpRequestMessage(HttpMethod.Get, versionsUrl); req.Headers.UserAgent.ParseAdd("XLauncher/3.4 (https://github.com/ppgg6/MC-Launcher-Revival)");
+                using var req = new HttpRequestMessage(HttpMethod.Get, versionsUrl); req.Headers.UserAgent.ParseAdd("XLauncher/4.0 (https://github.com/ppgg6/MC-Launcher-Revival)");
                 using var resp = await Http.SendAsync(req); resp.EnsureSuccessStatusCode(); using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
                 var version = doc.RootElement.EnumerateArray().FirstOrDefault();
                 if (version.ValueKind != JsonValueKind.Object) throw new Exception($"没有找到适用于 Minecraft {mc.Text} + {loaderName} 的发布文件。请确认版本和加载器。 ");
@@ -1055,16 +1144,16 @@ public partial class MainWindow : Window
         var oauth = AddField("Microsoft OAuth Client ID", OAuthClientIdText.Text);
         panel.Children.Add(new TextBlock { Text = "默认启动内存", Margin = new Thickness(0,10,0,4), Foreground = System.Windows.Media.Brushes.DimGray });
         var memory = new ComboBox { Padding = new Thickness(6), ItemsSource = new[] { "1024", "2048", "4096", "6144", "8192", "12288", "16384" }, SelectedItem = GetMemory().ToString() }; panel.Children.Add(memory);
-        var auto = new CheckBox { Content = "启动器启动时自动检查已安装版本", IsChecked = true, Margin = new Thickness(0,14,0,6) }; panel.Children.Add(auto);
+        var auto = new CheckBox { Content = "启动器启动时自动检查已安装版本", IsChecked = _autoCheckInstalled, Margin = new Thickness(0,14,0,6) }; panel.Children.Add(auto);
         var note = new TextBlock { Text = "提示：修改游戏目录后，下载和启动页面都会使用新目录。Java 路径需指向 java.exe。", TextWrapping = TextWrapping.Wrap, Foreground = System.Windows.Media.Brushes.Gray, Margin = new Thickness(0,8,0,12) }; panel.Children.Add(note);
         var buttons = new WrapPanel { HorizontalAlignment = HorizontalAlignment.Right }; var save = new Button { Content = "保存设置", Padding = new Thickness(18,9,18,9), Background = System.Windows.Media.Brushes.SteelBlue, Foreground = System.Windows.Media.Brushes.White }; var cancel = new Button { Content = "取消", Padding = new Thickness(18,9,18,9) }; buttons.Children.Add(save); buttons.Children.Add(cancel); panel.Children.Add(buttons);
-        save.Click += (_,__) => { try { _gameDir = dir.Text.Trim(); GameDirectoryText.Text = _gameDir; _javaPath = string.IsNullOrWhiteSpace(java.Text) ? null : java.Text.Trim(); OAuthClientIdText.Text = oauth.Text.Trim(); if (memory.SelectedItem is string m) { int idx = new[] {"1024","2048","4096","6144","8192"}.ToList().IndexOf(m); if (idx >= 0) MemoryCombo.SelectedIndex = Math.Min(idx, MemoryCombo.Items.Count - 1); else MemoryCombo.SelectedIndex = 2; } Directory.CreateDirectory(_gameDir); SaveSettings(); SetStatus("设置已保存"); win.Close(); } catch(Exception ex) { MessageBox.Show("保存失败：" + ex.Message); } };
+        save.Click += (_,__) => { try { _autoCheckInstalled = auto.IsChecked == true; _gameDir = dir.Text.Trim(); GameDirectoryText.Text = _gameDir; _javaPath = string.IsNullOrWhiteSpace(java.Text) ? null : java.Text.Trim(); OAuthClientIdText.Text = oauth.Text.Trim(); if (memory.SelectedItem is string m) MemoryCombo.SelectedIndex = MemoryIndex(m); Directory.CreateDirectory(_gameDir); SaveSettings(); SetStatus("设置已保存"); win.Close(); } catch(Exception ex) { MessageBox.Show("保存失败：" + ex.Message); } };
         cancel.Click += (_,__) => win.Close(); win.Content = new ScrollViewer { Content = panel }; win.ShowDialog();
     }
 
     private string SettingsPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XLauncher", "settings.json");
-    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=Math.Clamp(new[]{1024,2048,4096,6144,8192,12288,16384}.ToList().IndexOf(mem),0,4); if(r.TryGetProperty("versionJavaPaths",out var mappings)&&mappings.ValueKind==JsonValueKind.Object) _versionJavaPaths=mappings.EnumerateObject().Where(x=>x.Value.ValueKind==JsonValueKind.String).ToDictionary(x=>x.Name,x=>x.Value.GetString()!,StringComparer.OrdinalIgnoreCase); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
-    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString(), versionJavaPaths=_versionJavaPaths }, new JsonSerializerOptions { WriteIndented=true })); }
+    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("autoCheckInstalled",out var ac)) _autoCheckInstalled=ac.ValueKind==JsonValueKind.True; if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=MemoryIndex(mem.ToString()); if(r.TryGetProperty("versionJavaPaths",out var mappings)&&mappings.ValueKind==JsonValueKind.Object) _versionJavaPaths=mappings.EnumerateObject().Where(x=>x.Value.ValueKind==JsonValueKind.String).ToDictionary(x=>x.Name,x=>x.Value.GetString()!,StringComparer.OrdinalIgnoreCase); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
+    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString(), autoCheckInstalled=_autoCheckInstalled, versionJavaPaths=_versionJavaPaths }, new JsonSerializerOptions { WriteIndented=true })); }
 
     private void DownloadPage_Click(object sender, RoutedEventArgs e)
     {
