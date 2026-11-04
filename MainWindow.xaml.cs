@@ -166,7 +166,20 @@ public partial class MainWindow : Window
                 using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(15));
                 using var response = await JavaHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
                 // 只有服务器明确返回 206 才能追加；若忽略 Range 返回 200，就安全地从头覆盖。
+                // HTTP 416 表示请求的 Range 超出服务器文件长度：旧 .part 不能继续追加。
+                if (response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+                {
+                    response.Dispose();
+                    if (File.Exists(partial)) File.Delete(partial);
+                    throw new IOException("服务器返回 HTTP 416，已删除无效续传文件；下一次将从头下载。");
+                }
                 bool append = offset > 0 && response.StatusCode == System.Net.HttpStatusCode.PartialContent;
+                if (append && response.Content.Headers.ContentRange?.From != offset)
+                {
+                    response.Dispose();
+                    if (File.Exists(partial)) File.Delete(partial);
+                    throw new IOException("服务器返回的续传起始位置与本地文件长度不一致，已重置下载。");
+                }
                 if (offset > 0 && !append) offset = 0;
                 response.EnsureSuccessStatusCode();
                 long? totalBytes = response.Content.Headers.ContentRange?.Length;
@@ -231,6 +244,9 @@ public partial class MainWindow : Window
         const int workerCount = 4;
         const int bufferSize = 1024 * 1024;
         long totalLength;
+        // 不复用上一次崩溃留下的分段文件，避免把不同下载批次的数据拼在一起。
+        for (int i = 0; i < workerCount; i++)
+            try { string stale = partial + $".seg{i}"; if (File.Exists(stale)) File.Delete(stale); } catch { }
         try
         {
             using var probeRequest = new HttpRequestMessage(HttpMethod.Get, url);
