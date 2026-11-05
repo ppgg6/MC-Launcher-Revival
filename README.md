@@ -1,4 +1,4 @@
-# X Launcher v4.0.0-preview4 开发版
+# X Launcher v4.0.0-preview6 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -84,3 +84,30 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - 状态文字与进度条移到底部常驻状态栏，下载和安装过程不会再「看不到进度」。
 - 统一按钮、输入框、卡片的圆角与留白，侧栏去掉花哨图标，改成纯文字导航。
 - 账户状态文案统一（正版 / 离线 / 未登录）。
+
+
+
+## v4.0.0-preview5：Fabric 加载器安装
+
+- 版本卡片新增「安装 Fabric」：选中一个原版版本后点它，启动器会向 Fabric 官方 meta API 查询该版本可用的加载器，写入 `versions/fabric-loader-<loader>-<mc>/`，并把 Fabric 新增的库下载到 `libraries/`。
+- 新增版本继承（`inheritsFrom`）合并：启动加载器版本时，会把父版本（原版）的 `assets`、`assetIndex`、`javaVersion`、`logging` 与库列表合并进来，`libraries` 和 `arguments` 按「父在前、子在后」拼接。
+- 库解析支持只有 Maven 坐标（`name` + `url`）的库，这是 Fabric 提供的库的格式。
+- 启动判断放宽：加载器版本自己没有 jar，只要继承链根版本（原版）的 jar 存在就认为可启动。
+- natives 目录改为使用根版本（原版）的 `natives`，不再要求加载器版本自己也有一份。
+
+> 说明：本版只做 Fabric。Forge / NeoForge 需要运行官方安装器，留给下个版本。
+> 仍然没有在 Windows 实机上跑过，请以 GitHub Actions 编译 + 实机测试结果为准。
+
+
+
+## v4.0.0-preview6：性能与老机器适配
+
+- **下载并发自适应**：按 CPU 核数取 `核数 ÷ 2`（2~8 路）。老机器 4 核只跑 2 路，新机器最多 8 路，避免下载把机器压死。
+- **日志与状态批量刷新**：原来每条日志、每次状态更新都同步阻塞 UI 线程；改成入队后每 150 ms 合并刷新一次，下载线程不再排队等界面。
+- **日志框限长**：超过 1200 行只保留最后 600 行，长时间下载不会越用越卡。
+- **已存在文件快速通道**：大小一致就直接复用，不再对每个文件重算 SHA-1 —— 机械盘上这是安装慢的主因。
+- **版本列表虚拟化**：列表开启 `VirtualizingStackPanel` 回收模式，几千个版本也不会一次性创建控件。
+- **首次运行按物理内存给默认值**：4 GB 及以下默认 2048 MB，其余 4096 MB。
+- **构建配置**：工作站 GC + 并发 GC + TieredPGO，冷启动更稳。
+
+> 说明：并发与内存的自动值只在第一次运行（没有 `settings.json`）时生效，之后以你自己保存的设置为准。

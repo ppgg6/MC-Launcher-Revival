@@ -6,10 +6,14 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>XLauncher</AssemblyName>
-    <Version>4.0.0-preview4</Version>
+    <Version>4.0.0-preview6</Version>
     <AssemblyVersion>4.0.0.0</AssemblyVersion>
     <FileVersion>4.0.0.0</FileVersion>
     <RootNamespace>MC_Launcher_Revival</RootNamespace>
+    <!-- 桌面应用用工作站 GC，避免后台线程抢 CPU；分层编译加快冷启动 -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
     <DebugType>None</DebugType>
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>

@@ -24,7 +24,10 @@ public partial class MainWindow : Window
         PooledConnectionLifetime = TimeSpan.FromMinutes(10),
         ConnectTimeout = TimeSpan.FromSeconds(30)
     }) { Timeout = Timeout.InfiniteTimeSpan };
-    private static readonly SemaphoreSlim DownloadSlots = new(8, 8);
+    // 按 CPU 核数自适应：老机器少开一点，避免下载 + SHA-1 把机器压死；新机器最多 8 路。
+    private static readonly int MaxParallel = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
+    private static readonly SemaphoreSlim DownloadSlots = new(MaxParallel, MaxParallel);
+    private static readonly long TotalRamBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
     private List<VersionRow> _versions = new();
     private static readonly int[] MemoryOptions = { 1024, 2048, 4096, 6144, 8192, 12288, 16384 };
     private bool _autoCheckInstalled = true;
@@ -37,26 +40,63 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        StartUiPump();
         GameDirectoryText.Text = _gameDir;
         // 只在这里订阅一次；以前写在 LoadVersionsAsync 里，每刷新一次清单就多挂一个回调。
         VersionsList.SelectionChanged += (_, __) => UpdateLaunchAvailability();
         Log("X 启动器初始化：独立下载页、启动页、设置页与模组管理。");
         LoadSavedSettings();
+        if (!File.Exists(SettingsPath)) ApplyRecommendedMemory();
         // Java 自动安装开关改动后立即存盘，下次打开还是上次的选择。
         AutoJavaCheck.Checked += (_, __) => { try { SaveSettings(); } catch { } };
         AutoJavaCheck.Unchecked += (_, __) => { try { SaveSettings(); } catch { } };
         CheckInstalledVersions();
+        Log($"性能适配：{Environment.ProcessorCount} 核 CPU，物理内存约 {Math.Max(1, TotalRamBytes / 1024 / 1024 / 1024)} GB，下载并发 {MaxParallel}，本次分配 {GetMemory()} MB。");
         Log("启动器已初始化。请先选择账户，再安装并启动游戏。");
     }
+
+    // 日志与状态先入队，由定时器合并刷新：老机器上频繁同步 Invoke 会让下载线程排队等 UI。
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _pendingLog = new();
+    private string? _pendingStatus;
+    private int _logLines;
 
     private void Log(string text)
     {
         App.WriteLogLine(text);
-        Dispatcher.Invoke(() =>
+        _pendingLog.Enqueue($"[{DateTime.Now:HH:mm:ss}] {text}");
+    }
+
+    private void StartUiPump()
+    {
+        var timer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background)
         {
-            LogText.AppendText($"[{DateTime.Now:HH:mm:ss}] {text}{Environment.NewLine}");
+            Interval = TimeSpan.FromMilliseconds(150)
+        };
+        timer.Tick += (_, __) => FlushUi();
+        timer.Start();
+    }
+
+    private void FlushUi()
+    {
+        var sb = new System.Text.StringBuilder();
+        while (sb.Length < 6000 && _pendingLog.TryDequeue(out var line)) sb.Append(line).Append(Environment.NewLine);
+        if (sb.Length > 0)
+        {
+            string chunk = sb.ToString();
+            LogText.AppendText(chunk);
+            _logLines += chunk.Count(c => c == '\n');
+            // 日志框无限增长会让老机器越来越卡：超过 1200 行就只留最后 600 行。
+            if (_logLines > 1200)
+            {
+                var lines = LogText.Text.Split('\n');
+                var tail = lines.Skip(Math.Max(0, lines.Length - 600)).ToArray();
+                LogText.Text = string.Join("\n", tail);
+                _logLines = tail.Length;
+            }
             LogText.ScrollToEnd();
-        });
+        }
+        if (_pendingStatus is string status && !string.Equals(StatusText.Text, status, StringComparison.Ordinal))
+            StatusText.Text = status;
     }
 
     private async void LoadVersions_Click(object sender, RoutedEventArgs e) => await LoadVersionsAsync();
@@ -82,7 +122,7 @@ public partial class MainWindow : Window
         catch (Exception ex) { SetStatus("获取版本列表失败：" + ex.Message); Log("清单失败：" + ex); }
     }
 
-    private void SetStatus(string text) => Dispatcher.Invoke(() => StatusText.Text = "状态：" + text);
+    private void SetStatus(string text) => _pendingStatus = "状态：" + text;
 
     private void DetectJava_Click(object sender, RoutedEventArgs e)
     {
@@ -652,6 +692,102 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>判断版本能否启动：自己的 jar，或继承链根版本（原版）的 jar 存在。</summary>
+    private bool VersionLooksInstalled(string id)
+    {
+        try
+        {
+            string dir = Path.Combine(_gameDir, "versions", id);
+            if (!File.Exists(Path.Combine(dir, id + ".json"))) return false;
+            string root = ResolveRootVersion(id);
+            return File.Exists(Path.Combine(_gameDir, "versions", root, root + ".jar"));
+        }
+        catch { return false; }
+    }
+
+    private async void InstallFabric_Click(object sender, RoutedEventArgs e)
+    {
+        string mc = (VersionsList.SelectedItem as VersionRow)?.Id ?? "";
+        if (string.IsNullOrWhiteSpace(mc))
+        {
+            MessageBox.Show("请先在版本列表里选中一个 Minecraft 版本，再安装 Fabric。", "需要选择版本");
+            return;
+        }
+        if (MessageBox.Show($"将为 Minecraft {mc} 安装 Fabric 加载器（会自动下载 Fabric 的库文件）。继续吗？",
+                "安装 Fabric", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        try { await InstallFabricAsync(mc); }
+        catch (Exception ex)
+        {
+            SetStatus("Fabric 安装失败：" + ex.Message);
+            Log("Fabric 安装失败：" + ex);
+            MessageBox.Show(ex.Message, "安装失败");
+        }
+    }
+
+    /// <summary>安装 Fabric：拉取加载器版本与 profile，落盘版本 JSON 并下载它新增的库。</summary>
+    private async Task InstallFabricAsync(string mcVersion)
+    {
+        SetStatus($"正在查询 Minecraft {mcVersion} 可用的 Fabric 加载器……");
+        using var listResp = await Http.GetAsync($"https://meta.fabricmc.net/v2/versions/loader/{Uri.EscapeDataString(mcVersion)}");
+        listResp.EnsureSuccessStatusCode();
+        using var listDoc = JsonDocument.Parse(await listResp.Content.ReadAsStringAsync());
+        if (listDoc.RootElement.ValueKind != JsonValueKind.Array || listDoc.RootElement.GetArrayLength() == 0)
+            throw new InvalidDataException($"Minecraft {mcVersion} 没有可用的 Fabric 加载器（版本号可能写错，或还没有支持）。");
+        string loader = listDoc.RootElement[0].GetProperty("loader").GetProperty("version").GetString()
+            ?? throw new InvalidDataException("Fabric 返回的加载器版本为空。");
+
+        SetStatus($"正在获取 Fabric {loader} 的版本配置……");
+        using var profResp = await Http.GetAsync(
+            $"https://meta.fabricmc.net/v2/versions/loader/{Uri.EscapeDataString(mcVersion)}/{Uri.EscapeDataString(loader)}/profile/json");
+        profResp.EnsureSuccessStatusCode();
+        string profileJson = await profResp.Content.ReadAsStringAsync();
+        using var profDoc = JsonDocument.Parse(profileJson);
+        var profile = profDoc.RootElement;
+
+        string id = profile.TryGetProperty("id", out var idEl) && idEl.GetString() is string pid && !string.IsNullOrWhiteSpace(pid)
+            ? pid : $"fabric-loader-{loader}-{mcVersion}";
+        string versionDir = Path.Combine(_gameDir, "versions", id);
+        Directory.CreateDirectory(versionDir);
+        await File.WriteAllTextAsync(Path.Combine(versionDir, id + ".json"), profileJson);
+        Log($"已写入 Fabric 版本配置：{id}");
+
+        SetStatus($"正在下载 Fabric {loader} 的库文件……");
+        int count = await DownloadMavenLibrariesAsync(profile);
+        Log($"Fabric 库文件处理完成：{count} 个。");
+
+        if (AutoJavaCheck.IsChecked == true) await EnsureJavaForVersionAsync(MergeVersionChain(id), id);
+
+        Progress.Value = 100;
+        SetStatus($"Fabric {loader} 已安装到 Minecraft {mcVersion}，版本名 {id}。");
+        if (!_versions.Any(v => string.Equals(v.Id, id, StringComparison.OrdinalIgnoreCase)))
+        {
+            _versions.Insert(0, new VersionRow(id, "fabric", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), ""));
+            VersionsList.ItemsSource = null;
+            VersionsList.ItemsSource = _versions;
+        }
+        VersionsList.SelectedItem = _versions.FirstOrDefault(v => string.Equals(v.Id, id, StringComparison.OrdinalIgnoreCase));
+        UpdateLaunchAvailability();
+        MessageBox.Show($"Fabric 安装完成。\n\n版本：{id}\n\n现在可以把 Fabric 模组放进 {Path.Combine(_gameDir, "mods")} 再启动。", "安装完成");
+    }
+
+    /// <summary>下载只有 Maven 坐标（name + url）的库，例如 Fabric 提供的那些。</summary>
+    private async Task<int> DownloadMavenLibrariesAsync(JsonElement profile)
+    {
+        if (!profile.TryGetProperty("libraries", out var libs)) return 0;
+        var jobs = new List<Task>();
+        foreach (var lib in libs.EnumerateArray())
+        {
+            string? name = lib.TryGetProperty("name", out var n) ? n.GetString() : null;
+            string? baseUrl = lib.TryGetProperty("url", out var u) ? u.GetString() : null;
+            string? rel = string.IsNullOrWhiteSpace(name) ? null : MavenRelativePath(name!);
+            if (string.IsNullOrWhiteSpace(baseUrl) || rel is null) continue;
+            string dest = Path.Combine(_gameDir, "libraries", rel.Replace('/', Path.DirectorySeparatorChar));
+            jobs.Add(DownloadAndVerifyAsync(baseUrl!.TrimEnd('/') + "/" + rel, dest, null, null));
+        }
+        await Task.WhenAll(jobs);
+        return jobs.Count;
+    }
+
     /// <summary>元数据没有 javaVersion 时，按版本号猜一个主版本。</summary>
     private static int GuessJavaMajor(string version)
     {
@@ -740,7 +876,7 @@ public partial class MainWindow : Window
         if (!indexDoc.RootElement.TryGetProperty("objects", out var objects)) return;
         var entries = objects.EnumerateObject().ToList();
         int done = 0;
-        await Parallel.ForEachAsync(entries, new ParallelOptions { MaxDegreeOfParallelism = 8 }, async (obj, ct) =>
+        await Parallel.ForEachAsync(entries, new ParallelOptions { MaxDegreeOfParallelism = MaxParallel }, async (obj, ct) =>
         {
             var hash = obj.Value.GetProperty("hash").GetString();
             if (!string.IsNullOrWhiteSpace(hash) && hash.Length >= 2)
@@ -753,7 +889,7 @@ public partial class MainWindow : Window
             int current = Interlocked.Increment(ref done);
             if (current % 50 == 0 || current == entries.Count)
             {
-                Dispatcher.Invoke(() => Progress.Value = 60 + 39.0 * current / Math.Max(1, entries.Count));
+                Dispatcher.BeginInvoke(() => Progress.Value = 60 + 39.0 * current / Math.Max(1, entries.Count));
                 Log($"资源并发下载进度：{current}/{entries.Count}");
             }
         });
@@ -766,8 +902,9 @@ public partial class MainWindow : Window
         if (File.Exists(path))
         {
             var fi = new FileInfo(path);
-            if ((!expectedSize.HasValue || fi.Length == expectedSize.Value) &&
-                (string.IsNullOrWhiteSpace(sha1) || await Sha1Async(path) == sha1.ToLowerInvariant())) return;
+            // 快速通道：大小对得上就认为已存在，不再对每个文件重算 SHA-1 —— 机械盘上这一步是安装慢的主因。
+            // 真损坏了启动时会报错，届时删掉重下即可。
+            if (!expectedSize.HasValue || fi.Length == expectedSize.Value) return;
             File.Delete(path);
         }
         await DownloadSlots.WaitAsync();
@@ -808,6 +945,110 @@ public partial class MainWindow : Window
         if (artifact.TryGetProperty("path", out var p))
             return Path.Combine(_gameDir, "libraries", p.GetString()!.Replace('/', Path.DirectorySeparatorChar));
         return null;
+    }
+
+    /// <summary>把 Maven 坐标（group:artifact:version[:classifier]）转成库目录里的相对路径。</summary>
+    private static string? MavenRelativePath(string name)
+    {
+        var parts = name.Split(':');
+        if (parts.Length < 3 || parts.Any(string.IsNullOrWhiteSpace)) return null;
+        string group = parts[0].Replace('.', '/'), artifact = parts[1], version = parts[2];
+        string classifier = parts.Length > 3 && !string.IsNullOrWhiteSpace(parts[3]) ? "-" + parts[3] : "";
+        return $"{group}/{artifact}/{version}/{artifact}-{version}{classifier}.jar";
+    }
+
+    /// <summary>读取指定版本的 JSON（不存在则抛）。</summary>
+    private JsonElement LoadVersionJson(string id)
+    {
+        string path = Path.Combine(_gameDir, "versions", id, id + ".json");
+        if (!File.Exists(path)) throw new FileNotFoundException($"找不到版本 JSON：{path}");
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        return doc.RootElement.Clone();
+    }
+
+    /// <summary>沿 inheritsFrom 找到最底层的原版版本 id（无继承则返回自身）。</summary>
+    private string ResolveRootVersion(string id, int depth = 0)
+    {
+        if (depth > 6) return id;
+        var self = LoadVersionJson(id);
+        if (self.TryGetProperty("inheritsFrom", out var parent) && parent.GetString() is string parentId && !string.IsNullOrWhiteSpace(parentId))
+            return ResolveRootVersion(parentId, depth + 1);
+        return id;
+    }
+
+    /// <summary>把加载器版本的增量 JSON 合并成完整版本（父在前、子覆盖；库和参数按序拼接）。</summary>
+    private JsonElement MergeVersionChain(string id, int depth = 0)
+    {
+        if (depth > 6) throw new InvalidDataException("版本继承层数过深，疑似 inheritsFrom 循环。");
+        var self = LoadVersionJson(id);
+        if (!self.TryGetProperty("inheritsFrom", out var parentEl) || parentEl.GetString() is not string parentId || string.IsNullOrWhiteSpace(parentId))
+            return self;
+        var parent = MergeVersionChain(parentId, depth + 1);
+
+        var merged = new System.Text.Json.Nodes.JsonObject();
+        foreach (var prop in parent.EnumerateObject())
+            merged[prop.Name] = System.Text.Json.Nodes.JsonNode.Parse(prop.Value.GetRawText());
+
+        foreach (var prop in self.EnumerateObject())
+        {
+            switch (prop.Name)
+            {
+                case "inheritsFrom":
+                    break;
+                case "libraries":
+                    merged["libraries"] = ConcatLibraries(parent, self);
+                    break;
+                case "arguments":
+                    merged["arguments"] = MergeArguments(parent, self);
+                    break;
+                case "minecraftArguments":
+                    {
+                        string a = parent.TryGetProperty("minecraftArguments", out var pa) ? pa.GetString() ?? "" : "";
+                        string b = prop.Value.GetString() ?? "";
+                        merged["minecraftArguments"] = (a + " " + b).Trim();
+                        break;
+                    }
+                default:
+                    merged[prop.Name] = System.Text.Json.Nodes.JsonNode.Parse(prop.Value.GetRawText());
+                    break;
+            }
+        }
+        merged["id"] = id;
+        return JsonDocument.Parse(merged.ToJsonString()).RootElement;
+    }
+
+    private static System.Text.Json.Nodes.JsonArray ConcatLibraries(JsonElement parent, JsonElement child)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var array = new System.Text.Json.Nodes.JsonArray();
+        foreach (var source in new[] { parent, child })
+        {
+            if (!source.TryGetProperty("libraries", out var libs)) continue;
+            foreach (var lib in libs.EnumerateArray())
+            {
+                string key = lib.TryGetProperty("name", out var n) ? n.GetString() ?? "" : Guid.NewGuid().ToString();
+                if (!seen.Add(key)) continue;
+                array.Add(System.Text.Json.Nodes.JsonNode.Parse(lib.GetRawText()));
+            }
+        }
+        return array;
+    }
+
+    private static System.Text.Json.Nodes.JsonObject MergeArguments(JsonElement parent, JsonElement child)
+    {
+        var result = new System.Text.Json.Nodes.JsonObject();
+        foreach (string kind in new[] { "game", "jvm" })
+        {
+            var list = new System.Text.Json.Nodes.JsonArray();
+            foreach (var source in new[] { parent, child })
+            {
+                if (!source.TryGetProperty("arguments", out var args) || !args.TryGetProperty(kind, out var arr)) continue;
+                foreach (var item in arr.EnumerateArray())
+                    list.Add(System.Text.Json.Nodes.JsonNode.Parse(item.GetRawText()));
+            }
+            result[kind] = list;
+        }
+        return result;
     }
 
     private async Task ExtractNativesAsync(JsonElement meta)
@@ -941,9 +1182,7 @@ public partial class MainWindow : Window
     private void UpdateLaunchAvailability()
     {
         bool hasIdentity = !string.IsNullOrWhiteSpace(_username) && !string.IsNullOrWhiteSpace(_uuid) && !string.IsNullOrWhiteSpace(_accessToken);
-        bool hasVersion = VersionsList.SelectedItem is VersionRow vr &&
-            File.Exists(Path.Combine(_gameDir, "versions", vr.Id, vr.Id + ".jar")) &&
-            File.Exists(Path.Combine(_gameDir, "versions", vr.Id, vr.Id + ".json"));
+        bool hasVersion = VersionsList.SelectedItem is VersionRow vr && VersionLooksInstalled(vr.Id);
         LaunchButton.IsEnabled = hasIdentity && hasVersion;
     }
 
@@ -978,9 +1217,13 @@ public partial class MainWindow : Window
         if (VersionsList.SelectedItem is not VersionRow selected) { SetStatus("请先选择版本。"); return; }
         try
         {
-            string versionDir = Path.Combine(_gameDir, "versions", selected.Id), jsonPath = Path.Combine(versionDir, selected.Id + ".json"), jarPath = Path.Combine(versionDir, selected.Id + ".jar");
-            if (!File.Exists(jsonPath) || !File.Exists(jarPath)) throw new FileNotFoundException("所选版本尚未完整安装，请先安装。 ");
-            using var doc = JsonDocument.Parse(await File.ReadAllTextAsync(jsonPath)); var meta = doc.RootElement;
+            string versionDir = Path.Combine(_gameDir, "versions", selected.Id), jsonPath = Path.Combine(versionDir, selected.Id + ".json");
+            if (!File.Exists(jsonPath)) throw new FileNotFoundException("所选版本尚未安装，请先安装。");
+            // 加载器版本（Fabric/Forge）只有增量 JSON，需要沿 inheritsFrom 合并回原版。
+            var meta = MergeVersionChain(selected.Id);
+            string rootId = ResolveRootVersion(selected.Id);
+            string jarPath = Path.Combine(_gameDir, "versions", rootId, rootId + ".jar");
+            if (!File.Exists(jarPath)) throw new FileNotFoundException($"缺少原版客户端 {rootId}.jar，请先安装这个原版版本。");
             int javaMajor = meta.TryGetProperty("javaVersion", out var jv) && jv.TryGetProperty("majorVersion", out var jm) ? jm.GetInt32() : GuessJavaMajor(selected.Id);
             string java;
             try
@@ -1001,7 +1244,7 @@ public partial class MainWindow : Window
                 SaveSettings();
             }
             Log($"版本 {selected.Id} 使用 Java {javaMajor}：{java}");
-            string natives = Path.Combine(versionDir, "natives");
+            string natives = Path.Combine(_gameDir, "versions", rootId, "natives");
             var cp = new List<string>(); if (meta.TryGetProperty("libraries", out var libs)) foreach (var lib in libs.EnumerateArray()) if (IsAllowed(lib) && lib.TryGetProperty("downloads", out var dl) && dl.TryGetProperty("artifact", out var art)) { var lp = ResolveLibraryPath(art); if (lp != null && File.Exists(lp)) cp.Add(lp); }
             cp.Add(jarPath);
             string assetIndex = meta.TryGetProperty("assetIndex", out var ai) ? ai.GetProperty("id").GetString()! : selected.Id;
@@ -1055,6 +1298,13 @@ public partial class MainWindow : Window
         foreach(var rule in rules.EnumerateArray()) { bool match=true; if(rule.TryGetProperty("os",out var os)&&os.TryGetProperty("name",out var n)&&n.GetString()!="windows") match=false; if(rule.TryGetProperty("features",out var f)&&f.EnumerateObject().Any()) match=false; if(match) allow=rule.TryGetProperty("action",out var a)&&a.GetString()=="allow"; } return allow;
     }
     private int GetMemory() => MemoryCombo.SelectedItem is ComboBoxItem item && int.TryParse(item.Content?.ToString(),out int mb) ? mb : MemoryOptions[2];
+
+    /// <summary>第一次运行时按物理内存给个安全默认值：4 GB 及以下给 2048，其它给 4096。</summary>
+    private void ApplyRecommendedMemory()
+    {
+        int mb = TotalRamBytes > 0 && TotalRamBytes <= 4L * 1024 * 1024 * 1024 ? 2048 : 4096;
+        MemoryCombo.SelectedIndex = MemoryIndex(mb.ToString());
+    }
 
     /// <summary>把内存值映射成下拉框下标；未知值回落到默认 4096，不再被 Math.Clamp 截成 1024/8192。</summary>
     private static int MemoryIndex(string? text)

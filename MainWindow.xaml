@@ -253,9 +253,12 @@
         <WrapPanel Margin="0,14,0,0">
          <Button Content="获取版本列表" Style="{StaticResource PrimaryButton}" Click="LoadVersions_Click"/>
          <Button Content="安装所选" Margin="8,0,0,0" Click="InstallSelected_Click"/>
+         <Button Content="安装 Fabric" Margin="8,0,0,0" Click="InstallFabric_Click"/>
         </WrapPanel>
         <CheckBox x:Name="AutoJavaCheck" Content="安装时同时准备对应 Java" IsChecked="True" Margin="2,12,0,0"/>
         <ListView x:Name="VersionsList" Height="242" Margin="0,12,0,0"
+                  VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                  ScrollViewer.CanContentScroll="True"
                   Background="#FCFDFE" BorderBrush="{StaticResource Line}" BorderThickness="1">
          <ListView.View>
           <GridView>
