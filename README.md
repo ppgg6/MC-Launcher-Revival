@@ -1,4 +1,4 @@
-# X Launcher v4.0.0-preview9 开发版
+# X Launcher v4.5.0-preview2 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -142,3 +142,40 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - 关键词留空＝浏览模式，按当前「Minecraft 版本 + 加载器」过滤，默认按下载量排序。
 - 新增排序下拉：按下载量 / 按最近更新 / 按相关度；切换即重新加载。
 - 加载结果为空时会提示「换加载器或清空条件」，而不是静默空白。
+
+
+
+## v4.0.0-preview10
+
+- **模组下载自动带版本**：打开模组窗口时，Minecraft 版本和加载器按当前选中的版本自动填好（加载器版本会沿 `inheritsFrom` 找到原版版本号）。
+- **下载游戏页只列官方版本**：Fabric / Forge 这类加载器版本不会再混进「下载游戏」列表，它们只属于「已安装版本」。
+
+
+
+## v4.0.0-preview11
+
+- 模组列表新增「图标」列，显示每个模组在 Modrinth 的头像，便于一眼区分（图标由 Modrinth CDN 提供，需要联网加载）。
+
+
+
+## v4.0.0-preview12
+
+- 版本卡片新增「删除版本」：删除选中版本的整个目录（含该版本的存档、模组、配置）。
+- 删除前会额外提醒两件事：该版本开了「版本隔离」时存档会一起没；如果有加载器版本继承它，删掉后那些版本起不来。
+- 删除只动 `versions/<id>/`，不碰共享的 `libraries/`、`assets/` 和全局目录。
+
+
+
+## v4.5.0-preview1（4.5 第一批）
+
+- **NeoForge 安装**：从 `maven-metadata.xml` 取版本（编号规则 `21.1.x` ↔ Minecraft `1.21.1`），下载官方 installer 后跑 `--installClient`。
+- **崩溃分析**：读取最近一次 `crash-reports/*.txt` 或 `logs/latest.log`，匹配常见特征（内存不足、Java 版本、模组缺失/冲突、Mixin 失败、GLFW 等）后给出中文结论，并附上日志结尾，不用玩家自己看堆栈。
+
+> 4.5 后续批次：整合包导入（.mrpack）、界面重做、皮肤编辑器、单文件断点续传。
+
+
+
+## v4.5.0-preview2（4.5 第二批）
+
+- **整合包导入**：选一个 `.mrpack`，读 `modrinth.index.json`，把 `files` 里的资源逐个下载到当前版本的游戏目录，再解压 `overrides/` 覆盖配置；带路径穿越防护，包版本与所选版本不一致时会先警告。
+- **单文件断点续传**：下载中断后保留 `.part`，下次用 HTTP Range 续传，不再整包重下；只有校验失败才丢弃临时文件。

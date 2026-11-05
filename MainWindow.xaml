@@ -255,6 +255,10 @@
          <Button Content="安装所选" Margin="8,0,0,0" Click="InstallSelected_Click"/>
          <Button Content="安装 Fabric" Margin="8,0,0,0" Click="InstallFabric_Click"/>
          <Button Content="安装 Forge" Margin="8,0,0,0" Click="InstallForge_Click"/>
+         <Button Content="删除版本" Margin="8,0,0,0" Click="DeleteVersion_Click"/>
+         <Button Content="安装 NeoForge" Margin="8,0,0,0" Click="InstallNeoForge_Click"/>
+         <Button Content="崩溃分析" Margin="8,0,0,0" Click="CrashAnalyze_Click"/>
+         <Button Content="导入整合包" Margin="8,0,0,0" Click="ImportModpack_Click"/>
         </WrapPanel>
         <CheckBox x:Name="AutoJavaCheck" Content="安装时同时准备对应 Java" IsChecked="True" Margin="2,12,0,0"/>
         <CheckBox x:Name="IsolatedCheck" Content="版本隔离（存档与模组独立）" Margin="2,8,0,0" IsEnabled="False"/>

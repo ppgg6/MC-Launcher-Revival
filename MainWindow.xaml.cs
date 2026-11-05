@@ -800,6 +800,261 @@ public partial class MainWindow : Window
         MessageBox.Show($"Fabric 安装完成。\n\n版本：{id}\n\n现在可以把 Fabric 模组放进 {Path.Combine(_gameDir, "mods")} 再启动。", "安装完成");
     }
 
+    /// <summary>删除选中版本：连它自己的目录（存档/模组/配置）一起删，加载器版本要确认不误删原版。</summary>
+    private void DeleteVersion_Click(object sender, RoutedEventArgs e)
+    {
+        string id = SelectedVersionId();
+        if (string.IsNullOrWhiteSpace(id)) { MessageBox.Show("请先在版本列表里选中一个版本。", "需要选择版本"); return; }
+        string dir = Path.Combine(_gameDir, "versions", id);
+        if (!Directory.Exists(dir)) { MessageBox.Show("这个版本的目录不存在，可能已经被删掉了。", "找不到版本"); return; }
+
+        // 有加载器版本依赖它时，删了会让那些版本起不来。
+        var dependents = Directory.Exists(Path.Combine(_gameDir, "versions"))
+            ? Directory.GetDirectories(Path.Combine(_gameDir, "versions"))
+                .Select(d => Path.GetFileName(d))
+                .Where(other => !string.Equals(other, id, StringComparison.OrdinalIgnoreCase))
+                .Where(other => { try { return string.Equals(ResolveRootVersion(other), id, StringComparison.OrdinalIgnoreCase) && !string.Equals(other, id, StringComparison.OrdinalIgnoreCase); } catch { return false; } })
+                .ToList()
+            : new List<string>();
+
+        string extra = "";
+        if (_isolatedVersions.Contains(id)) extra += "\n\n⚠ 这个版本开了隔离：它的存档、模组、配置都在这个目录里，会一起消失。";
+        if (dependents.Count > 0) extra += $"\n\n⚠ 这些加载器版本依赖它，删掉后将无法启动：\n{string.Join("\n", dependents.Take(5))}";
+
+        if (MessageBox.Show($"确定删除版本 {id} 吗？\n\n目录：{dir}{extra}", "确认删除",
+                MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+
+        try
+        {
+            Directory.Delete(dir, true);
+            _isolatedVersions.Remove(id);
+            _versionJavaPaths.Remove(id);
+            try { SaveSettings(); } catch { }
+            _versions.RemoveAll(v => string.Equals(v.Id, id, StringComparison.OrdinalIgnoreCase));
+            VersionsList.ItemsSource = null;
+            VersionsList.ItemsSource = _versions;
+            SyncIsolationCheck();
+            UpdateLaunchAvailability();
+            Log($"已删除版本：{id}");
+            SetStatus($"已删除版本 {id}。");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("删除失败：" + ex.Message + "\n\n如果游戏正在运行，请先退出游戏。", "删除失败");
+            Log("删除版本失败：" + ex);
+        }
+    }
+
+    private async void InstallNeoForge_Click(object sender, RoutedEventArgs e)
+    {
+        string mc = (VersionsList.SelectedItem as VersionRow)?.Id ?? "";
+        if (string.IsNullOrWhiteSpace(mc)) { MessageBox.Show("请先在版本列表里选中一个 Minecraft 版本。", "需要选择版本"); return; }
+        if (MessageBox.Show($"将为 Minecraft {mc} 安装 NeoForge（会下载官方安装器并运行，可能需要几分钟）。继续吗？",
+                "安装 NeoForge", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        try { await InstallNeoForgeAsync(mc); }
+        catch (Exception ex)
+        {
+            SetStatus("NeoForge 安装失败：" + ex.Message);
+            Log("NeoForge 安装失败：" + ex);
+            MessageBox.Show(ex.Message, "安装失败");
+        }
+    }
+
+    /// <summary>NeoForge 版本号形如 21.1.77，对应 Minecraft 1.21.1；安装同样走官方 installer。</summary>
+    private async Task InstallNeoForgeAsync(string mcVersion)
+    {
+        SetStatus("正在查询 NeoForge 版本……");
+        string xml;
+        using (var resp = await Http.GetAsync("https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml"))
+        {
+            resp.EnsureSuccessStatusCode();
+            xml = await resp.Content.ReadAsStringAsync();
+        }
+        var doc = System.Xml.Linq.XDocument.Parse(xml);
+        var all = doc.Descendants("version").Select(v => v.Value.Trim()).Where(v => v.Length > 0).ToList();
+        string prefix = mcVersion.StartsWith("1.", StringComparison.Ordinal) ? mcVersion.Substring(2) + "." : "";
+        string? picked = all.Where(v => v.StartsWith(prefix, StringComparison.Ordinal))
+                            .OrderByDescending(v => v, StringComparer.OrdinalIgnoreCase)
+                            .FirstOrDefault();
+        if (picked is null)
+            throw new InvalidDataException($"NeoForge 没有匹配 Minecraft {mcVersion} 的版本（它按 21.1.x 对应 1.21.1 这种规则编号）。");
+
+        string fileName = $"neoforge-{picked}-installer.jar";
+        string url = $"https://maven.neoforged.net/releases/net/neoforged/neoforge/{picked}/{fileName}";
+        string installer = Path.Combine(_gameDir, "installers", fileName);
+        SetStatus($"正在下载 NeoForge 安装器 {picked}……");
+        await DownloadAndVerifyAsync(url, installer, null, null);
+
+        int javaMajor = GuessJavaMajor(mcVersion);
+        string java;
+        try { java = FindJava(javaMajor); }
+        catch (FileNotFoundException)
+        {
+            var choice = MessageBox.Show($"运行 NeoForge 安装器需要 Java {javaMajor}，现在下载吗？", "缺少 Java", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (choice != MessageBoxResult.Yes) return;
+            java = await InstallJavaRuntimeAsync(javaMajor);
+        }
+
+        SetStatus("正在运行 NeoForge 安装器（可能要好几分钟）……");
+        var psi = new ProcessStartInfo(java) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true, WorkingDirectory = _gameDir };
+        psi.ArgumentList.Add("-jar"); psi.ArgumentList.Add(installer); psi.ArgumentList.Add("--installClient"); psi.ArgumentList.Add(_gameDir);
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException("NeoForge 安装器没有启动。");
+        var outTask = process.StandardOutput.ReadToEndAsync();
+        var errTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        string output = (await outTask) + "\n" + (await errTask);
+        if (process.ExitCode != 0) throw new InvalidOperationException($"NeoForge 安装器返回 {process.ExitCode}。最后输出：\n{TailText(output, 500)}");
+        Log("NeoForge 安装器完成：" + TailText(output, 160));
+
+        string versionsDir = Path.Combine(_gameDir, "versions");
+        string? installed = Directory.GetDirectories(versionsDir)
+            .Where(d => Path.GetFileName(d).Contains("neoforge", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(Directory.GetLastWriteTime).FirstOrDefault();
+        if (installed == null) throw new InvalidDataException("安装器跑完了，但 versions 里没有 NeoForge 版本。");
+        string id = Path.GetFileName(installed);
+        if (!_versions.Any(v => string.Equals(v.Id, id, StringComparison.OrdinalIgnoreCase)))
+        {
+            _versions.Insert(0, new VersionRow(id, "neoforge", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), ""));
+            VersionsList.ItemsSource = null; VersionsList.ItemsSource = _versions;
+        }
+        VersionsList.SelectedItem = _versions.FirstOrDefault(v => string.Equals(v.Id, id, StringComparison.OrdinalIgnoreCase));
+        UpdateLaunchAvailability();
+        SetStatus($"NeoForge {picked} 已安装（版本 {id}）。");
+        MessageBox.Show($"NeoForge 安装完成。\n\n版本：{id}", "安装完成");
+    }
+
+    private async void ImportModpack_Click(object sender, RoutedEventArgs e)
+    {
+        string id = SelectedVersionId();
+        if (string.IsNullOrWhiteSpace(id)) { MessageBox.Show("先选一个版本：整合包会装进这个版本的游戏目录。", "需要选择版本"); return; }
+        var picker = new OpenFileDialog { Title = "选择 Modrinth 整合包", Filter = "Modrinth 整合包 (*.mrpack)|*.mrpack|所有文件 (*.*)|*.*" };
+        if (picker.ShowDialog() != true) return;
+        string gameDir = GameDirForVersion(id);
+        if (MessageBox.Show($"将把整合包导入到：\n{gameDir}\n\n已有的同名文件会被覆盖。继续吗？",
+                "导入整合包", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        try { await ImportModpackAsync(picker.FileName, gameDir, id); }
+        catch (Exception ex)
+        {
+            SetStatus("整合包导入失败：" + ex.Message);
+            Log("整合包导入失败：" + ex);
+            MessageBox.Show(ex.Message, "导入失败");
+        }
+    }
+
+    /// <summary>导入 .mrpack：读 modrinth.index.json，下载 files、解压 overrides 到游戏目录。</summary>
+    private async Task ImportModpackAsync(string mrpack, string gameDir, string versionId)
+    {
+        string temp = Path.Combine(Path.GetTempPath(), "xlauncher-pack-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(temp);
+        try
+        {
+            SetStatus("正在解压整合包……");
+            System.IO.Compression.ZipFile.ExtractToDirectory(mrpack, temp, true);
+            string indexPath = Path.Combine(temp, "modrinth.index.json");
+            if (!File.Exists(indexPath)) throw new InvalidDataException("这个包里没有 modrinth.index.json，可能不是 Modrinth 整合包。");
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(indexPath));
+            string packName = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() ?? "" : Path.GetFileName(mrpack);
+            if (doc.RootElement.TryGetProperty("dependencies", out var deps))
+            {
+                string? mc = deps.TryGetProperty("minecraft", out var m) ? m.GetString() : null;
+                string loader = deps.EnumerateObject().FirstOrDefault(p => p.Name.Contains("loader", StringComparison.OrdinalIgnoreCase) || p.Name is "forge" or "neoforge").Name;
+                string root = ResolveRootVersion(versionId);
+                if (!string.IsNullOrWhiteSpace(mc) && !string.Equals(mc, root, StringComparison.OrdinalIgnoreCase)
+                    && MessageBox.Show($"这个整合包是给 Minecraft {mc} 的，当前选的版本继承自 {root}。仍要导入吗？", "版本不一致",
+                        MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+            }
+
+            var files = doc.RootElement.GetProperty("files").EnumerateArray().ToList();
+            int done = 0;
+            foreach (var f in files)
+            {
+                string rel = f.GetProperty("path").GetString() ?? "";
+                if (string.IsNullOrWhiteSpace(rel)) continue;
+                string dest = Path.GetFullPath(Path.Combine(gameDir, rel));
+                // 防止 ../ 跳出游戏目录。
+                if (!dest.StartsWith(Path.GetFullPath(gameDir) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) continue;
+                var urls = f.TryGetProperty("downloads", out var dl) ? dl.EnumerateArray().Select(x => x.GetString() ?? "").Where(x => x.Length > 0).ToList() : new List<string>();
+                if (urls.Count == 0) continue;
+                string? sha1 = f.TryGetProperty("hashes", out var hs) && hs.TryGetProperty("sha1", out var s1) ? s1.GetString() : null;
+                long? size = f.TryGetProperty("fileSize", out var fs) ? fs.GetInt64() : null;
+                await DownloadAndVerifyAsync(urls[0], dest, sha1, size);
+                done++;
+                SetStatus($"整合包 {packName}：{done}/{files.Count} 个文件");
+                Dispatcher.BeginInvoke(() => Progress.Value = files.Count == 0 ? 90 : 90.0 * done / files.Count);
+            }
+
+            string overrides = Path.Combine(temp, "overrides");
+            if (Directory.Exists(overrides)) CopyDirectory(overrides, gameDir);
+
+            Progress.Value = 100;
+            SetStatus($"整合包「{packName}」已导入：{done} 个文件。");
+            Log($"整合包导入完成：{packName} → {gameDir}（{done} 个文件）");
+            MessageBox.Show($"整合包「{packName}」导入完成。\n\n{files.Count} 个文件 + overrides 已放进：\n{gameDir}\n\n提示：记得确认加载器版本与整合包要求一致。", "导入完成");
+        }
+        finally
+        {
+            try { Directory.Delete(temp, true); } catch { }
+        }
+    }
+
+    private static void CopyDirectory(string source, string destination)
+    {
+        Directory.CreateDirectory(destination);
+        foreach (string file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+        {
+            string rel = Path.GetRelativePath(source, file);
+            string target = Path.Combine(destination, rel);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.Copy(file, target, true);
+        }
+    }
+
+    /// <summary>读取最近的崩溃报告/日志，给出中文结论，而不是让玩家自己看堆栈。</summary>
+    private void CrashAnalyze_Click(object sender, RoutedEventArgs e)
+    {
+        string id = SelectedVersionId();
+        string gameDir = string.IsNullOrWhiteSpace(id) ? _gameDir : GameDirForVersion(id);
+        var candidates = new List<string>();
+        try
+        {
+            string crashDir = Path.Combine(gameDir, "crash-reports");
+            if (Directory.Exists(crashDir)) candidates.AddRange(Directory.GetFiles(crashDir, "*.txt").OrderByDescending(File.GetLastWriteTime).Take(1));
+            string latest = Path.Combine(gameDir, "logs", "latest.log");
+            if (File.Exists(latest)) candidates.Add(latest);
+        }
+        catch { }
+        if (candidates.Count == 0)
+        {
+            MessageBox.Show($"没有找到崩溃报告或日志。\n\n查找位置：{gameDir}\n\n先启动一次游戏，崩了之后再点这里。", "没有可分析的日志");
+            return;
+        }
+
+        string file = candidates[0];
+        string text;
+        try { text = File.ReadAllText(file); }
+        catch (Exception ex) { MessageBox.Show("读取日志失败：" + ex.Message); return; }
+
+        var findings = new List<string>();
+        void Hit(string pattern, string verdict) { if (text.Contains(pattern, StringComparison.OrdinalIgnoreCase)) findings.Add(verdict); }
+
+        Hit("OutOfMemoryError", "内存不够：把「内存」调大一些（比如从 4096 提到 6144），或减少模组数量。");
+        Hit("UnsupportedClassVersionError", "Java 版本不匹配：这个版本要求的 Java 和你当前用的不一致，换对应主版本的 Java。");
+        Hit("java.lang.NoSuchMethodError", "模组或加载器版本不兼容：检查模组是否对应当前 Minecraft 与加载器版本。");
+        Hit("ModResolutionException", "模组依赖缺失或冲突：按崩溃报告里点名的模组补齐依赖或删掉冲突项。");
+        Hit("Duplicate mods", "装了重复的模组（同一个模组两个文件），删掉多余的那个。");
+        Hit("Mixin apply failed", "模组注入失败：通常是模组版本与该加载器不匹配，更新或移除最近装的模组。");
+        Hit("GLFW error", "显卡/驱动问题：更新显卡驱动，或试着关掉光影。");
+        Hit("The game crashed whilst", "游戏崩溃：详见报告里的 “Description” 一行。");
+
+        string tail = TailText(text, 1200);
+        string body = findings.Count > 0
+            ? "可能原因：\n" + string.Join("\n", findings.Distinct().Select((f, i) => $"{i + 1}. {f}"))
+            : "没有匹配到常见错误特征，先看下面报告的结尾部分。";
+        MessageBox.Show($"{body}\n\n—— 日志：{Path.GetFileName(file)} ——\n{tail}", "崩溃分析", MessageBoxButton.OK, MessageBoxImage.Information);
+        Log($"崩溃分析：{Path.GetFileName(file)}，命中 {findings.Count} 条特征。");
+    }
+
     private async void InstallForge_Click(object sender, RoutedEventArgs e)
     {
         string mc = (VersionsList.SelectedItem as VersionRow)?.Id ?? "";
@@ -1054,10 +1309,17 @@ public partial class MainWindow : Window
                 {
                     try
                     {
-                        using var response = await Http.GetAsync(candidate, HttpCompletionOption.ResponseHeadersRead);
+                        // 断点续传：上次留下的 .part 能续就续，省掉重下几百 MB。
+                        long already = File.Exists(temp) ? new FileInfo(temp).Length : 0;
+                        using var request = new HttpRequestMessage(HttpMethod.Get, candidate);
+                        if (already > 0 && expectedSize.HasValue && already >= expectedSize.Value) already = 0;
+                        if (already > 0) request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(already, null);
+                        using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
                         response.EnsureSuccessStatusCode();
+                        bool append = already > 0 && response.StatusCode == System.Net.HttpStatusCode.PartialContent;
+                        if (already > 0 && !append) already = 0;
                         await using (var input = await response.Content.ReadAsStreamAsync())
-                        await using (var output = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, true))
+                        await using (var output = new FileStream(temp, append ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, true))
                             await input.CopyToAsync(output);
                         var info = new FileInfo(temp);
                         if (expectedSize.HasValue && info.Length != expectedSize.Value) throw new InvalidDataException("文件大小校验失败：" + Path.GetFileName(path));
@@ -1068,7 +1330,8 @@ public partial class MainWindow : Window
                     catch (Exception ex)
                     {
                         last = ex;
-                        TryDeleteFile(temp);
+                        // 网络中断保留 .part 以便续传；校验类失败才丢弃，避免拼出坏文件。
+                        if (ex is InvalidDataException) TryDeleteFile(temp);
                         if (attempt < 3) await Task.Delay(400 * attempt);
                     }
                 }
@@ -1528,7 +1791,11 @@ public partial class MainWindow : Window
             var fabric = new Button { Content = "Fabric 官方下载", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7) };
             fabric.Click += (_,__) => Process.Start(new ProcessStartInfo("https://fabricmc.net/use/installer/") { UseShellExecute = true });
             var browse = new Button { Content = "在线搜索 / 下载模组（Modrinth）", Margin = new Thickness(0,0,8,0), Padding = new Thickness(12,7,12,7), Background = System.Windows.Media.Brushes.SteelBlue, Foreground = System.Windows.Media.Brushes.White };
-            browse.Click += async (_,__) => await OpenModrinthBrowserAsync(modsDir, Refresh);
+            browse.Click += async (_,__) =>
+            {
+                var (预设版本, 预设加载器) = GuessTargetFromSelection();
+                await OpenModrinthBrowserAsync(modsDir, Refresh, 预设版本, 预设加载器);
+            };
             buttons.Children.Add(open); buttons.Children.Add(import); buttons.Children.Add(remove); buttons.Children.Add(forge); buttons.Children.Add(fabric); buttons.Children.Add(browse);
             root.Children.Add(buttons); root.Children.Add(list); window.Content = root; Refresh(); window.ShowDialog();
         }
@@ -1537,23 +1804,53 @@ public partial class MainWindow : Window
 
     private sealed record ModrinthHit(string ProjectId, string Title, string Description, string Slug, string Downloads, string IconUrl);
 
-    private async Task OpenModrinthBrowserAsync(string modsDir, Action refreshMods)
+    /// <summary>从当前选中的版本推断「Minecraft 版本 + 加载器」，给模组下载窗口预填。</summary>
+    private (string Mc, string Loader) GuessTargetFromSelection()
+    {
+        string id = SelectedVersionId();
+        if (string.IsNullOrWhiteSpace(id)) return ("", "fabric");
+        string loader = "fabric";
+        string lower = id.ToLowerInvariant();
+        if (lower.Contains("neoforge")) loader = "neoforge";
+        else if (lower.Contains("forge")) loader = "forge";
+        else if (lower.Contains("quilt")) loader = "quilt";
+        else if (lower.Contains("fabric")) loader = "fabric";
+        try
+        {
+            // 加载器版本继承自原版，用根版本号当 Minecraft 版本。
+            string root = ResolveRootVersion(id);
+            if (!string.IsNullOrWhiteSpace(root)) return (root, loader);
+        }
+        catch { }
+        return (id, loader);
+    }
+
+    private async Task OpenModrinthBrowserAsync(string modsDir, Action refreshMods, string defaultMc = "1.20.1", string defaultLoader = "fabric")
     {
         var win = new Window { Title = "X · Modrinth 模组下载中心", Width = 980, Height = 690, Owner = this, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = System.Windows.Media.Brushes.White };
         var root = new DockPanel { Margin = new Thickness(20) };
         var top = new StackPanel();
         top.Children.Add(new TextBlock { Text = "在线模组下载中心", FontSize = 24, FontWeight = FontWeights.SemiBold });
         top.Children.Add(new TextBlock { Text = "打开即列出热门模组，也可以按关键词搜索。请确保所选 Minecraft 版本和加载器与游戏一致。", Foreground = System.Windows.Media.Brushes.Gray, Margin = new Thickness(0,5,0,10) });
-        var controls = new WrapPanel(); var query = new TextBox { Width = 300, Padding = new Thickness(8), Text = "" }; var mc = new TextBox { Width = 100, Padding = new Thickness(8), Text = "1.20.1" };
-        var loader = new ComboBox { Width = 120, Padding = new Thickness(6), ItemsSource = new[] { "fabric", "forge", "neoforge", "quilt" }, SelectedIndex = 0 };
+        var controls = new WrapPanel(); var query = new TextBox { Width = 300, Padding = new Thickness(8), Text = "" }; var mc = new TextBox { Width = 100, Padding = new Thickness(8), Text = string.IsNullOrWhiteSpace(defaultMc) ? "1.20.1" : defaultMc };
+        var loader = new ComboBox { Width = 120, Padding = new Thickness(6), ItemsSource = new[] { "fabric", "forge", "neoforge", "quilt" } };
+        loader.SelectedIndex = Math.Max(0, Array.IndexOf(new[] { "fabric", "forge", "neoforge", "quilt" }, defaultLoader));
         var search = new Button { Content = "搜索模组", Background = System.Windows.Media.Brushes.SteelBlue, Foreground = System.Windows.Media.Brushes.White };
         controls.Children.Add(new TextBlock { Text = "关键词", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(4) }); controls.Children.Add(query);
         controls.Children.Add(new TextBlock { Text = "Minecraft", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8,4,4,4) }); controls.Children.Add(mc);
         controls.Children.Add(new TextBlock { Text = "加载器", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8,4,4,4) }); controls.Children.Add(loader); controls.Children.Add(search);
         top.Children.Add(controls); DockPanel.SetDock(top, Dock.Top); root.Children.Add(top);
         var results = new ListView { Margin = new Thickness(0,12,0,12) };
-        var grid = new GridView(); grid.Columns.Add(new GridViewColumn { Header = "模组名称", DisplayMemberBinding = new System.Windows.Data.Binding("Title"), Width = 190 });
-        grid.Columns.Add(new GridViewColumn { Header = "简介", DisplayMemberBinding = new System.Windows.Data.Binding("Description"), Width = 490 });
+        var grid = new GridView();
+        // 每个模组显示自己的图标，方便一眼认出是哪个。
+        var iconFactory = new FrameworkElementFactory(typeof(Image));
+        iconFactory.SetBinding(Image.SourceProperty, new System.Windows.Data.Binding("IconUrl"));
+        iconFactory.SetValue(Image.WidthProperty, 30.0);
+        iconFactory.SetValue(Image.HeightProperty, 30.0);
+        iconFactory.SetValue(Image.StretchProperty, System.Windows.Media.Stretch.Uniform);
+        grid.Columns.Add(new GridViewColumn { Header = "图标", Width = 46, CellTemplate = new DataTemplate { VisualTree = iconFactory } });
+        grid.Columns.Add(new GridViewColumn { Header = "模组名称", DisplayMemberBinding = new System.Windows.Data.Binding("Title"), Width = 180 });
+        grid.Columns.Add(new GridViewColumn { Header = "简介", DisplayMemberBinding = new System.Windows.Data.Binding("Description"), Width = 440 });
         grid.Columns.Add(new GridViewColumn { Header = "下载量", DisplayMemberBinding = new System.Windows.Data.Binding("Downloads"), Width = 100 }); results.View = grid; root.Children.Add(results);
         var bottom = new StackPanel { Orientation = Orientation.Horizontal }; DockPanel.SetDock(bottom, Dock.Bottom);
         var install = new Button { Content = "下载并安装选中模组", Background = System.Windows.Media.Brushes.SeaGreen, Foreground = System.Windows.Media.Brushes.White };
@@ -1709,7 +2006,10 @@ public partial class MainWindow : Window
     {
         var win = new Window { Title = "X · 下载游戏", Width = 900, Height = 650, Owner = this, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = System.Windows.Media.Brushes.White };
         var root = new DockPanel { Margin = new Thickness(20) }; var head = new StackPanel(); head.Children.Add(new TextBlock { Text="下载游戏版本", FontSize=24, FontWeight=FontWeights.SemiBold }); head.Children.Add(new TextBlock { Text="在这里选择要下载的 Minecraft 版本；下载完成后会出现在‘启动游戏’页面。", Foreground=System.Windows.Media.Brushes.Gray, Margin=new Thickness(0,5,0,12) }); DockPanel.SetDock(head,Dock.Top); root.Children.Add(head);
-        var list = new ListView(); list.ItemsSource = _versions; list.DisplayMemberPath = "Id"; root.Children.Add(list);
+        var list = new ListView(); list.DisplayMemberPath = "Id"; root.Children.Add(list);
+        // 下载页只显示官方版本：加载器版本（fabric/forge/neoforge）属于已安装版本，不在这里出现。
+        var officialVersions = _versions.Where(v => v.Type is "release" or "snapshot" or "old_beta" or "old_alpha").ToList();
+        list.ItemsSource = officialVersions;
         var bottom = new StackPanel { Orientation=Orientation.Horizontal, Margin=new Thickness(0,12,0,0) }; DockPanel.SetDock(bottom,Dock.Bottom); var refresh = new Button { Content="刷新官方版本列表" }; var install = new Button { Content="下载 / 安装选中版本", Background=System.Windows.Media.Brushes.SteelBlue, Foreground=System.Windows.Media.Brushes.White }; var progress = new ProgressBar { Width=220, Height=14, Margin=new Thickness(12,8,0,0), IsIndeterminate=false }; bottom.Children.Add(refresh); bottom.Children.Add(install); bottom.Children.Add(progress); root.Children.Add(bottom);
         refresh.Click += async (_,__) => { await LoadVersionsAsync(); list.ItemsSource=_versions; }; install.Click += async (_,__) => { if(list.SelectedItem is not VersionRow row) { MessageBox.Show("请先选择版本。"); return; } VersionsList.SelectedItem = _versions.FirstOrDefault(x=>x.Id==row.Id); if(VersionsList.SelectedItem==null) { MessageBox.Show("版本清单尚未加载，请先刷新。"); return; } win.Activate(); InstallSelected_Click(this, new RoutedEventArgs()); progress.Value=Progress.Value; };
         win.Content=root; win.Loaded += async (_,__) => { if(_versions.Count==0) { await LoadVersionsAsync(); list.ItemsSource=_versions; } }; win.ShowDialog();
