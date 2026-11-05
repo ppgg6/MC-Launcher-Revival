@@ -1,4 +1,4 @@
-# X Launcher v4.0.0-preview6 开发版
+# X Launcher v4.0.0-preview9 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -111,3 +111,34 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - **构建配置**：工作站 GC + 并发 GC + TieredPGO，冷启动更稳。
 
 > 说明：并发与内存的自动值只在第一次运行（没有 `settings.json`）时生效，之后以你自己保存的设置为准。
+
+
+
+## v4.0.0-preview7：修复 Java 下载「文件被占用」
+
+- 复现：安装 Java 时出现 `The process cannot access the file '...temurin-25.zip.part' because it is being used by another process`，整个启动流程被判失败。
+- 原因：`.part` 临时文件可能被另一条下载线程或杀毒软件占用，而删除动作没有容错，异常一路抛到界面上。
+- 修复：新增 `TryDeleteFile`，所有临时文件（`.part`、`.segN`、安装包）删除失败只记日志、不中断流程。
+- 修复：Java 安装加互斥锁。同一时间只跑一个安装流程；重复点击时给出「Java 正在安装中，请稍候」的明确提示，而不是抢同一个文件。
+
+
+
+## v4.0.0-preview8：版本隔离 / 多源下载 / Forge 安装
+
+参考 PCL 社区版（Apache-2.0，C#）的工程思路重写，未复制其源码。
+
+- **版本隔离**：版本卡片新增「版本隔离」勾选。勾上后该版本用自己的 `versions/<id>/` 作为游戏目录，存档、模组、配置互不干扰；不勾则沿用全局目录。选择状态保存在 `settings.json` 的 `isolatedVersions`。
+- **下载多源回退**：官方源（Mojang / Forge maven）下载失败时自动切换 BMCLAPI 镜像（`resources` / `libraries` / `piston-meta` 三类地址已覆盖），国内网络更快。
+- **Forge 安装**：版本卡片新增「安装 Forge」。流程为查 `promotions_slim.json` 拿推荐版本 → 下载官方 installer → 用匹配主版本的 Java 执行 `--installClient` → 扫描 `versions/` 找到安装好的版本并加入列表；安装器输出会记进日志，失败时把最后 500 字符显示出来。
+- 资源包与安装器统一放进 `installers/` 目录，避免污染游戏目录。
+
+> 说明：Forge 安装器需要联网且耗时较长，未在本机实机验证；建议先用一个原版版本试装。
+
+
+
+## v4.0.0-preview9：模组列表免搜索
+
+- 打开「在线搜索 / 下载模组」窗口时**自动加载 50 个模组**，不再必须先输关键词。
+- 关键词留空＝浏览模式，按当前「Minecraft 版本 + 加载器」过滤，默认按下载量排序。
+- 新增排序下拉：按下载量 / 按最近更新 / 按相关度；切换即重新加载。
+- 加载结果为空时会提示「换加载器或清空条件」，而不是静默空白。

@@ -254,8 +254,10 @@
          <Button Content="获取版本列表" Style="{StaticResource PrimaryButton}" Click="LoadVersions_Click"/>
          <Button Content="安装所选" Margin="8,0,0,0" Click="InstallSelected_Click"/>
          <Button Content="安装 Fabric" Margin="8,0,0,0" Click="InstallFabric_Click"/>
+         <Button Content="安装 Forge" Margin="8,0,0,0" Click="InstallForge_Click"/>
         </WrapPanel>
         <CheckBox x:Name="AutoJavaCheck" Content="安装时同时准备对应 Java" IsChecked="True" Margin="2,12,0,0"/>
+        <CheckBox x:Name="IsolatedCheck" Content="版本隔离（存档与模组独立）" Margin="2,8,0,0" IsEnabled="False"/>
         <ListView x:Name="VersionsList" Height="242" Margin="0,12,0,0"
                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                   ScrollViewer.CanContentScroll="True"

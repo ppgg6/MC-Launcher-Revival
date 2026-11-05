@@ -36,6 +36,8 @@ public partial class MainWindow : Window
     private bool _offlineMode;
     private string? _javaPath;
     private Dictionary<string, string> _versionJavaPaths = new(StringComparer.OrdinalIgnoreCase);
+    // 版本隔离：勾上的版本用自己的 versions/<id>/ 当游戏目录（存档、模组、配置各自独立）。
+    private readonly HashSet<string> _isolatedVersions = new(StringComparer.OrdinalIgnoreCase);
 
     public MainWindow()
     {
@@ -43,7 +45,10 @@ public partial class MainWindow : Window
         StartUiPump();
         GameDirectoryText.Text = _gameDir;
         // 只在这里订阅一次；以前写在 LoadVersionsAsync 里，每刷新一次清单就多挂一个回调。
-        VersionsList.SelectionChanged += (_, __) => UpdateLaunchAvailability();
+        VersionsList.SelectionChanged += (_, __) => { UpdateLaunchAvailability(); SyncIsolationCheck(); };
+        IsolatedCheck.Checked += (_, __) => SetIsolation(true);
+        IsolatedCheck.Unchecked += (_, __) => SetIsolation(false);
+        SyncIsolationCheck();
         Log("X 启动器初始化：独立下载页、启动页、设置页与模组管理。");
         LoadSavedSettings();
         if (!File.Exists(SettingsPath)) ApplyRecommendedMemory();
@@ -171,7 +176,32 @@ public partial class MainWindow : Window
         catch { return true; }
     }
 
+    // 同一时间只允许一个 Java 安装流程，避免两次点击抢同一个 .zip.part。
+    private static readonly SemaphoreSlim JavaInstallGate = new(1, 1);
+
+    /// <summary>删文件；被占用时只记日志，不往上抛（典型场景：杀毒软件或另一条下载线程还开着句柄）。</summary>
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            try { System.Diagnostics.Debug.WriteLine($"删除失败 {path}: {ex.Message}"); } catch { }
+        }
+    }
+
     private async Task<string> InstallJavaRuntimeAsync(int major)
+    {
+        // 不排队也不硬闯：已有安装在进行时直接给一句明确提示，比让用户干等或报文件占用好。
+        if (!await JavaInstallGate.WaitAsync(0))
+            throw new InvalidOperationException("Java 正在安装中（可能是上一次点击触发的），请等这一次完成后再试。");
+        try { return await InstallJavaRuntimeCoreAsync(major); }
+        finally { JavaInstallGate.Release(); }
+    }
+
+    private async Task<string> InstallJavaRuntimeCoreAsync(int major)
     {
         if (major < 8 || major > 99) throw new ArgumentOutOfRangeException(nameof(major));
         string javaRoot = Path.Combine(_gameDir, "runtime");
@@ -195,7 +225,7 @@ public partial class MainWindow : Window
         if (Directory.Exists(installDir)) Directory.Delete(installDir, true);
         Directory.CreateDirectory(installDir);
         ZipFile.ExtractToDirectory(archive, installDir, true);
-        File.Delete(archive);
+        TryDeleteFile(archive);
         string? javaExe = Directory.GetFiles(installDir, "java.exe", SearchOption.AllDirectories).FirstOrDefault(x => x.Replace('\\','/').Contains("/bin/java.exe", StringComparison.OrdinalIgnoreCase));
         if (javaExe == null) throw new FileNotFoundException("压缩包中没有找到 bin/java.exe。");
         if (!TryGetJavaMajor(javaExe, out int installedMajor) || installedMajor != major)
@@ -239,14 +269,14 @@ public partial class MainWindow : Window
                     // 本地 .part 已经等于服务器文件总长度，说明上次其实已经下完（例如写完文件但没来得及改名），直接复用。
                     if (serverTotal.HasValue && File.Exists(partial) && new FileInfo(partial).Length == serverTotal.Value && TryFinalizeArchive(partial, archive, major))
                         return;
-                    if (File.Exists(partial)) File.Delete(partial);
+                    TryDeleteFile(partial);
                     throw new IOException("服务器返回 HTTP 416，已删除无效续传文件；下一次将从头下载。");
                 }
                 bool append = offset > 0 && response.StatusCode == System.Net.HttpStatusCode.PartialContent;
                 // 注意：ContentRange 缺失时不能直接比较（null != offset 恒为 true，会误删一个完好的续传文件）。
                 if (append && response.Content.Headers.ContentRange is { From: long rangeFrom } && rangeFrom != offset)
                 {
-                    if (File.Exists(partial)) File.Delete(partial);
+                    TryDeleteFile(partial);
                     throw new IOException("服务器返回的续传起始位置与本地文件长度不一致，已重置下载。");
                 }
                 if (offset > 0 && !append) offset = 0;
@@ -408,7 +438,7 @@ public partial class MainWindow : Window
                     }
                     catch
                     {
-                        if (File.Exists(segmentPath)) File.Delete(segmentPath);
+                        TryDeleteFile(segmentPath);
                         if (attempt == 4) throw;
                         await Task.Delay(500 * attempt);
                     }
@@ -434,7 +464,7 @@ public partial class MainWindow : Window
         {
             Log($"Java {major} 分段加速下载不可用，切换为断点续传模式：{ex.Message}");
             // 这里的 partial 是多段合并到一半的产物，不能当作可续传的前缀，必须丢掉后从头下。
-            if (File.Exists(partial)) File.Delete(partial);
+            TryDeleteFile(partial);
             return false;
         }
         finally
@@ -770,6 +800,111 @@ public partial class MainWindow : Window
         MessageBox.Show($"Fabric 安装完成。\n\n版本：{id}\n\n现在可以把 Fabric 模组放进 {Path.Combine(_gameDir, "mods")} 再启动。", "安装完成");
     }
 
+    private async void InstallForge_Click(object sender, RoutedEventArgs e)
+    {
+        string mc = (VersionsList.SelectedItem as VersionRow)?.Id ?? "";
+        if (string.IsNullOrWhiteSpace(mc))
+        {
+            MessageBox.Show("请先在版本列表里选中一个 Minecraft 版本，再安装 Forge。", "需要选择版本");
+            return;
+        }
+        if (MessageBox.Show($"将为 Minecraft {mc} 安装 Forge（会下载官方安装器并运行它，可能需要几分钟）。继续吗？",
+                "安装 Forge", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        try { await InstallForgeAsync(mc); }
+        catch (Exception ex)
+        {
+            SetStatus("Forge 安装失败：" + ex.Message);
+            Log("Forge 安装失败：" + ex);
+            MessageBox.Show(ex.Message, "安装失败");
+        }
+    }
+
+    /// <summary>用官方安装器装 Forge：查推荐版本 → 下 installer → 用匹配的 Java 跑 --installClient。</summary>
+    private async Task InstallForgeAsync(string mcVersion)
+    {
+        SetStatus($"正在查询 Forge {mcVersion} 的可用版本……");
+        string promotions;
+        using (var resp = await Http.GetAsync("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"))
+        {
+            resp.EnsureSuccessStatusCode();
+            promotions = await resp.Content.ReadAsStringAsync();
+        }
+        using var promosDoc = JsonDocument.Parse(promotions);
+        string? forgeVer = null;
+        if (promosDoc.RootElement.TryGetProperty("promos", out var promos))
+        {
+            if (promos.TryGetProperty(mcVersion + "-recommended", out var rec)) forgeVer = rec.GetString();
+            else if (promos.TryGetProperty(mcVersion + "-latest", out var lat)) forgeVer = lat.GetString();
+        }
+        if (string.IsNullOrWhiteSpace(forgeVer))
+            throw new InvalidDataException($"Forge 没有支持 Minecraft {mcVersion} 的版本（到官网确认该版本是否已被支持）。");
+
+        string fileName = $"forge-{mcVersion}-{forgeVer}-installer.jar";
+        string url = $"https://maven.minecraftforge.net/net/minecraftforge/forge/{mcVersion}-{forgeVer}/{fileName}";
+        string installer = Path.Combine(_gameDir, "installers", fileName);
+        SetStatus($"正在下载 Forge 安装器 {forgeVer}……");
+        await DownloadAndVerifyAsync(url, installer, null, null);
+
+        int javaMajor = GuessJavaMajor(mcVersion);
+        string java;
+        try { java = FindJava(javaMajor); }
+        catch (FileNotFoundException)
+        {
+            var choice = MessageBox.Show($"运行 Forge 安装器需要 Java {javaMajor}，当前没有找到。现在下载吗？",
+                "缺少 Java", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (choice != MessageBoxResult.Yes) return;
+            java = await InstallJavaRuntimeAsync(javaMajor);
+        }
+
+        SetStatus($"正在运行 Forge 安装器（这一步可能要好几分钟，请不要关掉启动器）……");
+        var psi = new ProcessStartInfo(java)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            WorkingDirectory = _gameDir
+        };
+        psi.ArgumentList.Add("-jar");
+        psi.ArgumentList.Add(installer);
+        psi.ArgumentList.Add("--installClient");
+        psi.ArgumentList.Add(_gameDir);
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException("Forge 安装器没有启动。");
+        var outTask = process.StandardOutput.ReadToEndAsync();
+        var errTask = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        string output = (await outTask) + "\n" + (await errTask);
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"Forge 安装器返回 {process.ExitCode}。最后输出：\n{TailText(output, 500)}");
+        Log("Forge 安装器完成，输出片段：" + TailText(output, 160));
+
+        string versionsDir = Path.Combine(_gameDir, "versions");
+        string? installed = Directory.Exists(versionsDir)
+            ? Directory.GetDirectories(versionsDir)
+                .Where(d => Path.GetFileName(d).Contains("forge", StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(Directory.GetLastWriteTime)
+                .FirstOrDefault()
+            : null;
+        if (installed == null) throw new InvalidDataException("Forge 安装器跑完了，但 versions 目录里没有出现新版本。");
+        string id = Path.GetFileName(installed);
+        Log($"Forge 版本已安装：{id}");
+
+        if (!_versions.Any(v => string.Equals(v.Id, id, StringComparison.OrdinalIgnoreCase)))
+        {
+            _versions.Insert(0, new VersionRow(id, "forge", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), ""));
+            VersionsList.ItemsSource = null;
+            VersionsList.ItemsSource = _versions;
+        }
+        Progress.Value = 100;
+        SetStatus($"Forge {forgeVer} 已安装（版本 {id}）。");
+        VersionsList.SelectedItem = _versions.FirstOrDefault(v => string.Equals(v.Id, id, StringComparison.OrdinalIgnoreCase));
+        UpdateLaunchAvailability();
+        MessageBox.Show($"Forge 安装完成。\n\n版本：{id}\n\n模组请放进对应版本的 mods 目录。", "安装完成");
+    }
+
+    private static string TailText(string text, int max)
+        => string.IsNullOrEmpty(text) ? "" : (text.Length <= max ? text : text[^max..]);
+
     /// <summary>下载只有 Maven 坐标（name + url）的库，例如 Fabric 提供的那些。</summary>
     private async Task<int> DownloadMavenLibrariesAsync(JsonElement profile)
     {
@@ -912,26 +1047,52 @@ public partial class MainWindow : Window
         {
             string temp = path + ".part";
             Exception? last = null;
-            for (int attempt = 1; attempt <= 3; attempt++)
+            // 多源回退：官方源失败后自动换 BMCLAPI 镜像，适合国内网络。
+            foreach (string candidate in UrlCandidates(url))
             {
-                try
+                for (int attempt = 1; attempt <= 3; attempt++)
                 {
-                    using var response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-                    response.EnsureSuccessStatusCode();
-                    await using (var input = await response.Content.ReadAsStreamAsync())
-                    await using (var output = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, true))
-                        await input.CopyToAsync(output);
-                    var info = new FileInfo(temp);
-                    if (expectedSize.HasValue && info.Length != expectedSize.Value) throw new InvalidDataException("文件大小校验失败：" + Path.GetFileName(path));
-                    if (!string.IsNullOrWhiteSpace(sha1) && await Sha1Async(temp) != sha1.ToLowerInvariant()) throw new InvalidDataException("SHA-1 校验失败：" + Path.GetFileName(path));
-                    File.Move(temp, path, true);
-                    return;
+                    try
+                    {
+                        using var response = await Http.GetAsync(candidate, HttpCompletionOption.ResponseHeadersRead);
+                        response.EnsureSuccessStatusCode();
+                        await using (var input = await response.Content.ReadAsStreamAsync())
+                        await using (var output = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, true))
+                            await input.CopyToAsync(output);
+                        var info = new FileInfo(temp);
+                        if (expectedSize.HasValue && info.Length != expectedSize.Value) throw new InvalidDataException("文件大小校验失败：" + Path.GetFileName(path));
+                        if (!string.IsNullOrWhiteSpace(sha1) && await Sha1Async(temp) != sha1.ToLowerInvariant()) throw new InvalidDataException("SHA-1 校验失败：" + Path.GetFileName(path));
+                        File.Move(temp, path, true);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        last = ex;
+                        TryDeleteFile(temp);
+                        if (attempt < 3) await Task.Delay(400 * attempt);
+                    }
                 }
-                catch (Exception ex) { last = ex; if (File.Exists(temp)) File.Delete(temp); if (attempt < 3) await Task.Delay(500 * attempt); }
+                if (!string.Equals(candidate, url, StringComparison.Ordinal))
+                    Log("官方源失败，已切换镜像：" + Path.GetFileName(path));
             }
-            throw new IOException($"下载失败（已重试 3 次）：{Path.GetFileName(path)}", last);
+            throw new IOException($"下载失败（官方源与镜像都试过了）：{Path.GetFileName(path)}", last);
         }
         finally { DownloadSlots.Release(); }
+    }
+
+    /// <summary>给出同一个文件的候选地址：官方源在前，BMCLAPI 镜像在后。</summary>
+    private static IEnumerable<string> UrlCandidates(string url)
+    {
+        yield return url;
+        const string assets = "https://resources.download.minecraft.net/";
+        const string libs = "https://libraries.minecraft.net/";
+        const string meta = "https://piston-meta.mojang.com/";
+        if (url.StartsWith(assets, StringComparison.OrdinalIgnoreCase))
+            yield return "https://bmclapi2.bangbang93.com/assets/" + url[assets.Length..];
+        else if (url.StartsWith(libs, StringComparison.OrdinalIgnoreCase))
+            yield return "https://bmclapi2.bangbang93.com/maven/" + url[libs.Length..];
+        else if (url.StartsWith(meta, StringComparison.OrdinalIgnoreCase))
+            yield return "https://bmclapi2.bangbang93.com/" + url[meta.Length..];
     }
 
     private static async Task<string> Sha1Async(string path)
@@ -1248,7 +1409,7 @@ public partial class MainWindow : Window
             var cp = new List<string>(); if (meta.TryGetProperty("libraries", out var libs)) foreach (var lib in libs.EnumerateArray()) if (IsAllowed(lib) && lib.TryGetProperty("downloads", out var dl) && dl.TryGetProperty("artifact", out var art)) { var lp = ResolveLibraryPath(art); if (lp != null && File.Exists(lp)) cp.Add(lp); }
             cp.Add(jarPath);
             string assetIndex = meta.TryGetProperty("assetIndex", out var ai) ? ai.GetProperty("id").GetString()! : selected.Id;
-            var vars = new Dictionary<string,string> { ["${natives_directory}"]=natives, ["${launcher_name}"]="MCLauncherRevival", ["${launcher_version}"]="1.2", ["${classpath}"]=string.Join(Path.PathSeparator,cp), ["${classpath_separator}"]=Path.PathSeparator.ToString(), ["${library_directory}"]=Path.Combine(_gameDir,"libraries"), ["${auth_player_name}"]=_username, ["${version_name}"]=selected.Id, ["${game_directory}"]=_gameDir, ["${assets_root}"]=Path.Combine(_gameDir,"assets"), ["${assets_index_name}"]=assetIndex, ["${auth_uuid}"]=_uuid, ["${auth_access_token}"]=_accessToken!, ["${user_type}"]=_userType ?? "legacy", ["${version_type}"]=meta.TryGetProperty("type",out var typ)?typ.GetString()!:"release", ["${user_properties}"]="{}", ["${clientid}"]="", ["${auth_xuid}"]="", ["${auth_session}"]=_accessToken!, ["${game_assets}"]=Path.Combine(_gameDir,"assets","virtual","legacy"), ["${resolution_width}"]="854", ["${resolution_height}"]="480" };
+            var vars = new Dictionary<string,string> { ["${natives_directory}"]=natives, ["${launcher_name}"]="MCLauncherRevival", ["${launcher_version}"]="1.2", ["${classpath}"]=string.Join(Path.PathSeparator,cp), ["${classpath_separator}"]=Path.PathSeparator.ToString(), ["${library_directory}"]=Path.Combine(_gameDir,"libraries"), ["${auth_player_name}"]=_username, ["${version_name}"]=selected.Id, ["${game_directory}"]=GameDirForVersion(selected.Id), ["${assets_root}"]=Path.Combine(_gameDir,"assets"), ["${assets_index_name}"]=assetIndex, ["${auth_uuid}"]=_uuid, ["${auth_access_token}"]=_accessToken!, ["${user_type}"]=_userType ?? "legacy", ["${version_type}"]=meta.TryGetProperty("type",out var typ)?typ.GetString()!:"release", ["${user_properties}"]="{}", ["${clientid}"]="", ["${auth_xuid}"]="", ["${auth_session}"]=_accessToken!, ["${game_assets}"]=Path.Combine(_gameDir,"assets","virtual","legacy"), ["${resolution_width}"]="854", ["${resolution_height}"]="480" };
             var args = new List<string>();
             if (meta.TryGetProperty("arguments", out var arguments)) { args.Add("-Xmx"+GetMemory()+"M"); args.Add("-Djava.library.path="+natives); AddArguments(arguments,"jvm",args,vars); if(meta.TryGetProperty("mainClass",out var mc)) args.Add(mc.GetString()!); AddArguments(arguments,"game",args,vars); }
             else
@@ -1264,7 +1425,7 @@ public partial class MainWindow : Window
                     args.Add(flag); args.Add(value);
                 }
                 AddIfMissing("--version", selected.Id);
-                AddIfMissing("--gameDir", _gameDir);
+                AddIfMissing("--gameDir", GameDirForVersion(selected.Id));
                 AddIfMissing("--assetsDir", Path.Combine(_gameDir, "assets"));
                 AddIfMissing("--assetIndex", assetIndex);
                 AddIfMissing("--uuid", _uuid);
@@ -1273,7 +1434,7 @@ public partial class MainWindow : Window
                 AddIfMissing("--username", _username);
             }
             if (meta.TryGetProperty("logging",out var logging) && logging.TryGetProperty("client",out var lc) && lc.TryGetProperty("argument",out var la)) { string cfg=Path.Combine(_gameDir,"assets","log_configs",lc.GetProperty("file").GetProperty("id").GetString()??""); if(File.Exists(cfg)) args.Insert(0,ReplaceVars(la.GetString()??"",new Dictionary<string,string>{{"${path}",cfg}})); }
-            var psi = new ProcessStartInfo(java) { WorkingDirectory=_gameDir, UseShellExecute=false };
+            var psi = new ProcessStartInfo(java) { WorkingDirectory=GameDirForVersion(selected.Id), UseShellExecute=false };
             foreach(var a in args) psi.ArgumentList.Add(a);
             Log("启动命令："+java+" "+string.Join(" ",args.Select(a=>a.Contains(' ')?"[带空格参数]":a)));
             var proc=Process.Start(psi) ?? throw new Exception("Java 进程未能启动。"); SetStatus((_offlineMode ? "Minecraft 已通过离线模式启动，进程 PID=" : "Minecraft 已启动，进程 PID=")+proc.Id); Log("Minecraft 进程已启动 PID="+proc.Id+(_offlineMode?"（离线身份）":"（正版身份）"));
@@ -1339,7 +1500,7 @@ public partial class MainWindow : Window
         try
         {
             _gameDir = string.IsNullOrWhiteSpace(GameDirectoryText.Text) ? _gameDir : GameDirectoryText.Text.Trim();
-            string modsDir = Path.Combine(_gameDir, "mods");
+            string modsDir = Path.Combine(GameDirForVersion(SelectedVersionId()), "mods");
             Directory.CreateDirectory(modsDir);
             var files = Directory.GetFiles(modsDir).Where(f => f.EndsWith(".jar", StringComparison.OrdinalIgnoreCase) || f.EndsWith(".jar.disabled", StringComparison.OrdinalIgnoreCase)).ToList();
             var window = new Window { Title = "模组管理 · MC Launcher Revival", Width = 650, Height = 500, WindowStartupLocation = WindowStartupLocation.CenterOwner, Owner = this, Background = System.Windows.Media.Brushes.White };
@@ -1382,7 +1543,7 @@ public partial class MainWindow : Window
         var root = new DockPanel { Margin = new Thickness(20) };
         var top = new StackPanel();
         top.Children.Add(new TextBlock { Text = "在线模组下载中心", FontSize = 24, FontWeight = FontWeights.SemiBold });
-        top.Children.Add(new TextBlock { Text = "通过 Modrinth 官方 API 搜索模组。请确保所选 Minecraft 版本和加载器与游戏一致。", Foreground = System.Windows.Media.Brushes.Gray, Margin = new Thickness(0,5,0,10) });
+        top.Children.Add(new TextBlock { Text = "打开即列出热门模组，也可以按关键词搜索。请确保所选 Minecraft 版本和加载器与游戏一致。", Foreground = System.Windows.Media.Brushes.Gray, Margin = new Thickness(0,5,0,10) });
         var controls = new WrapPanel(); var query = new TextBox { Width = 300, Padding = new Thickness(8), Text = "" }; var mc = new TextBox { Width = 100, Padding = new Thickness(8), Text = "1.20.1" };
         var loader = new ComboBox { Width = 120, Padding = new Thickness(6), ItemsSource = new[] { "fabric", "forge", "neoforge", "quilt" }, SelectedIndex = 0 };
         var search = new Button { Content = "搜索模组", Background = System.Windows.Media.Brushes.SteelBlue, Foreground = System.Windows.Media.Brushes.White };
@@ -1396,24 +1557,66 @@ public partial class MainWindow : Window
         grid.Columns.Add(new GridViewColumn { Header = "下载量", DisplayMemberBinding = new System.Windows.Data.Binding("Downloads"), Width = 100 }); results.View = grid; root.Children.Add(results);
         var bottom = new StackPanel { Orientation = Orientation.Horizontal }; DockPanel.SetDock(bottom, Dock.Bottom);
         var install = new Button { Content = "下载并安装选中模组", Background = System.Windows.Media.Brushes.SeaGreen, Foreground = System.Windows.Media.Brushes.White };
-        var openProject = new Button { Content = "打开项目网页" }; var status = new TextBlock { Text = "搜索结果将显示在这里。", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10,0,0,0) };
+        var openProject = new Button { Content = "打开项目网页" }; var status = new TextBlock { Text = "正在加载模组列表……", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(10,0,0,0) };
         var progress = new ProgressBar { Width = 170, Height = 14, Margin = new Thickness(8,8,0,0) }; bottom.Children.Add(install); bottom.Children.Add(openProject); bottom.Children.Add(progress); bottom.Children.Add(status); root.Children.Add(bottom);
         List<ModrinthHit> hits = new();
-        search.Click += async (_,__) =>
+        var sortBox = new ComboBox { Width = 120, Padding = new Thickness(6), ItemsSource = new[] { "按下载量", "按最近更新", "按相关度" }, SelectedIndex = 0 };
+        controls.Children.Add(new TextBlock { Text = "排序", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8,4,4,4) });
+        controls.Children.Add(sortBox);
+
+        // 按当前 Minecraft 版本 + 加载器拼 facets；两者留空就不过滤，直接列全部模组。
+        string BuildFacets()
         {
-            if (string.IsNullOrWhiteSpace(query.Text)) { MessageBox.Show(win, "请输入模组名称或关键词。"); return; }
-            search.IsEnabled = false; status.Text = "正在搜索 Modrinth……";
+            var parts = new List<string> { "[\"project_type:mod\"]" };
+            string mcText = mc.Text.Trim();
+            if (mcText.Length > 0) parts.Add($"[\"versions:{mcText}\"]");
+            if (loader.SelectedItem is string l && l.Length > 0) parts.Add($"[\"categories:{l}\"]");
+            return "[" + string.Join(",", parts) + "]";
+        }
+
+        string SortIndex() => sortBox.SelectedIndex switch
+        {
+            1 => "updated",
+            2 => "relevance",
+            _ => "downloads"
+        };
+
+        async Task RunSearchAsync()
+        {
+            search.IsEnabled = false; install.IsEnabled = false;
+            status.Text = "正在从 Modrinth 加载模组……";
             try
             {
-                string url = "https://api.modrinth.com/v2/search?query=" + Uri.EscapeDataString(query.Text.Trim()) + "&facets=" + Uri.EscapeDataString("[[\"project_type:mod\"]]") + "&limit=30";
-                using var req = new HttpRequestMessage(HttpMethod.Get, url); req.Headers.UserAgent.ParseAdd("XLauncher/4.0 (https://github.com/ppgg6/MC-Launcher-Revival)");
-                using var resp = await Http.SendAsync(req); resp.EnsureSuccessStatusCode(); using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
-                hits = doc.RootElement.GetProperty("hits").EnumerateArray().Select(x => new ModrinthHit(x.GetProperty("project_id").GetString() ?? "", x.GetProperty("title").GetString() ?? "", x.GetProperty("description").GetString() ?? "", x.GetProperty("slug").GetString() ?? "", x.GetProperty("downloads").ToString(), x.TryGetProperty("icon_url", out var icon) ? icon.GetString() ?? "" : "")).ToList();
-                results.ItemsSource = hits; status.Text = $"找到 {hits.Count} 个项目。安装时会再次核对版本和加载器。";
+                string url = "https://api.modrinth.com/v2/search?query=" + Uri.EscapeDataString(query.Text.Trim())
+                    + "&facets=" + Uri.EscapeDataString(BuildFacets())
+                    + "&index=" + SortIndex() + "&limit=50";
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                req.Headers.UserAgent.ParseAdd("XLauncher/4.0 (https://github.com/ppgg6/MC-Launcher-Revival)");
+                using var resp = await Http.SendAsync(req);
+                resp.EnsureSuccessStatusCode();
+                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+                hits = doc.RootElement.GetProperty("hits").EnumerateArray().Select(x => new ModrinthHit(
+                    x.GetProperty("project_id").GetString() ?? "",
+                    x.GetProperty("title").GetString() ?? "",
+                    x.GetProperty("description").GetString() ?? "",
+                    x.GetProperty("slug").GetString() ?? "",
+                    x.GetProperty("downloads").ToString(),
+                    x.TryGetProperty("icon_url", out var icon) ? icon.GetString() ?? "" : "")).ToList();
+                results.ItemsSource = null;
+                results.ItemsSource = hits;
+                status.Text = hits.Count == 0
+                    ? "这个条件下一个模组都没有，试着清空关键词或换加载器。"
+                    : $"已加载 {hits.Count} 个模组，选中后点「下载并安装」。";
             }
-            catch (Exception ex) { status.Text = "搜索失败：" + ex.Message; }
-            finally { search.IsEnabled = true; }
-        };
+            catch (Exception ex) { status.Text = "加载失败：" + ex.Message; }
+            finally { search.IsEnabled = true; install.IsEnabled = true; }
+        }
+
+        search.Click += async (_, __) => await RunSearchAsync();
+        sortBox.SelectionChanged += async (_, __) => await RunSearchAsync();
+        // 打开窗口就先列出热门模组，不用先搜。
+        win.Loaded += async (_, __) => await RunSearchAsync();
+
         openProject.Click += (_,__) => { if (results.SelectedItem is ModrinthHit hit) Process.Start(new ProcessStartInfo("https://modrinth.com/mod/" + Uri.EscapeDataString(hit.Slug)) { UseShellExecute = true }); };
         install.Click += async (_,__) =>
         {
@@ -1462,9 +1665,45 @@ public partial class MainWindow : Window
         cancel.Click += (_,__) => win.Close(); win.Content = new ScrollViewer { Content = panel }; win.ShowDialog();
     }
 
+    /// <summary>某个版本实际的游戏目录：隔离版本用 versions/&lt;id&gt;，否则用全局目录。</summary>
+    private string GameDirForVersion(string id)
+    {
+        if (string.IsNullOrWhiteSpace(id) || !_isolatedVersions.Contains(id)) return _gameDir;
+        string dir = Path.Combine(_gameDir, "versions", id);
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private string SelectedVersionId() => (VersionsList.SelectedItem as VersionRow)?.Id ?? "";
+
+    private bool _syncingIsolation;
+
+    /// <summary>把「版本隔离」勾选框同步成当前选中版本的状态。</summary>
+    private void SyncIsolationCheck()
+    {
+        string id = SelectedVersionId();
+        _syncingIsolation = true;
+        try
+        {
+            IsolatedCheck.IsEnabled = !string.IsNullOrWhiteSpace(id);
+            IsolatedCheck.IsChecked = !string.IsNullOrWhiteSpace(id) && _isolatedVersions.Contains(id);
+        }
+        finally { _syncingIsolation = false; }
+    }
+
+    private void SetIsolation(bool on)
+    {
+        if (_syncingIsolation) return;
+        string id = SelectedVersionId();
+        if (string.IsNullOrWhiteSpace(id)) return;
+        if (on) _isolatedVersions.Add(id); else _isolatedVersions.Remove(id);
+        try { SaveSettings(); } catch { }
+        Log(on ? $"已开启版本隔离：{id}（存档与模组放在 versions/{id}/）" : $"已关闭版本隔离：{id}（回到全局游戏目录）");
+    }
+
     private string SettingsPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XLauncher", "settings.json");
-    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("autoCheckInstalled",out var ac)) _autoCheckInstalled=ac.ValueKind==JsonValueKind.True; if(r.TryGetProperty("autoJavaOnInstall",out var aj)) AutoJavaCheck.IsChecked=aj.ValueKind==JsonValueKind.True; if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=MemoryIndex(mem.ToString()); if(r.TryGetProperty("versionJavaPaths",out var mappings)&&mappings.ValueKind==JsonValueKind.Object) _versionJavaPaths=mappings.EnumerateObject().Where(x=>x.Value.ValueKind==JsonValueKind.String).ToDictionary(x=>x.Name,x=>x.Value.GetString()!,StringComparer.OrdinalIgnoreCase); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
-    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString(), autoCheckInstalled=_autoCheckInstalled, autoJavaOnInstall=AutoJavaCheck.IsChecked==true, versionJavaPaths=_versionJavaPaths }, new JsonSerializerOptions { WriteIndented=true })); }
+    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("autoCheckInstalled",out var ac)) _autoCheckInstalled=ac.ValueKind==JsonValueKind.True; if(r.TryGetProperty("autoJavaOnInstall",out var aj)) AutoJavaCheck.IsChecked=aj.ValueKind==JsonValueKind.True; if(r.TryGetProperty("isolatedVersions",out var iv)&&iv.ValueKind==JsonValueKind.Array) { _isolatedVersions.Clear(); foreach(var e in iv.EnumerateArray()) if(e.GetString() is string sid) _isolatedVersions.Add(sid); } if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=MemoryIndex(mem.ToString()); if(r.TryGetProperty("versionJavaPaths",out var mappings)&&mappings.ValueKind==JsonValueKind.Object) _versionJavaPaths=mappings.EnumerateObject().Where(x=>x.Value.ValueKind==JsonValueKind.String).ToDictionary(x=>x.Name,x=>x.Value.GetString()!,StringComparer.OrdinalIgnoreCase); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
+    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString(), autoCheckInstalled=_autoCheckInstalled, autoJavaOnInstall=AutoJavaCheck.IsChecked==true, isolatedVersions=_isolatedVersions.ToArray(), versionJavaPaths=_versionJavaPaths }, new JsonSerializerOptions { WriteIndented=true })); }
 
     private void DownloadPage_Click(object sender, RoutedEventArgs e)
     {
