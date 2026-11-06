@@ -34,11 +34,21 @@ public partial class MainWindow : Window
     private bool _autoCheckInstalled = true;
     private string _gameDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), ".minecraft");
     private string? _accessToken, _uuid, _username, _userType;
+    private string? _refreshToken;
     private bool _offlineMode;
     private string? _javaPath;
     private Dictionary<string, string> _versionJavaPaths = new(StringComparer.OrdinalIgnoreCase);
     // 版本隔离：勾上的版本用自己的 versions/<id>/ 当游戏目录（存档、模组、配置各自独立）。
     private readonly HashSet<string> _isolatedVersions = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>每个实例自己的内存、Java、备注（没设就用全局的）。</summary>
+    private sealed class InstanceProfile
+    {
+        public int? Memory { get; set; }
+        public string? JavaPath { get; set; }
+        public string? Note { get; set; }
+    }
+    private Dictionary<string, InstanceProfile> _instances = new(StringComparer.OrdinalIgnoreCase);
 
     public MainWindow()
     {
@@ -57,6 +67,7 @@ public partial class MainWindow : Window
         AutoJavaCheck.Checked += (_, __) => { try { SaveSettings(); } catch { } };
         AutoJavaCheck.Unchecked += (_, __) => { try { SaveSettings(); } catch { } };
         CheckInstalledVersions();
+        _ = RestoreAccountAsync();
         Log($"性能适配：{Environment.ProcessorCount} 核 CPU，物理内存约 {Math.Max(1, TotalRamBytes / 1024 / 1024 / 1024)} GB，下载并发 {MaxParallel}，本次分配 {GetMemory()} MB。");
         Log("启动器已初始化。请先选择账户，再安装并启动游戏。");
     }
@@ -70,6 +81,8 @@ public partial class MainWindow : Window
     {
         App.WriteLogLine(text);
         _pendingLog.Enqueue($"[{DateTime.Now:HH:mm:ss}] {text}");
+        _recentLogs.Add($"[{DateTime.Now:HH:mm:ss}] {text}");
+        if (_recentLogs.Count > 200) _recentLogs.RemoveAt(0);
     }
 
     private void StartUiPump()
@@ -605,6 +618,16 @@ public partial class MainWindow : Window
         foreach (var part in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)) Add(Path.Combine(part.Trim('"'), "java.exe"), "系统 PATH");
         string runtime = Path.Combine(_gameDir, "runtime");
         if (Directory.Exists(runtime)) foreach (var file in Directory.GetFiles(runtime, "java.exe", SearchOption.AllDirectories)) Add(file, "X 托管运行时");
+        // 注册表里登记的 JDK/JRE（64/32 位都要看）
+        foreach (var candidate in RegistryJavaPaths()) Add(candidate, "注册表");
+        foreach (var vendor in new[] { "Java", "Eclipse Adoptium", "Eclipse Foundation", "Zulu", "Microsoft", "BellSoft", "Amazon Corretto", "Semeru" })
+            foreach (var baseDir in new[] { Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86) })
+            {
+                string root = Path.Combine(baseDir, vendor);
+                if (!Directory.Exists(root)) continue;
+                try { foreach (var file in Directory.GetFiles(root, "java.exe", SearchOption.AllDirectories)) Add(file, "系统已安装"); } catch { }
+            }
+
         foreach (var baseDir in new[] { Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86) })
         {
             string adoptium = Path.Combine(baseDir, "Eclipse Adoptium");
@@ -634,6 +657,32 @@ public partial class MainWindow : Window
             return major > 0;
         }
         catch { return false; }
+    }
+
+    /// <summary>读注册表里登记的 Java 路径（HKEY_LOCAL_MACHINE\SOFTWARE\JavaSoft\...）。</summary>
+    private static IEnumerable<string> RegistryJavaPaths()
+    {
+        var list = new List<string>();
+        foreach (var view in new[] { Microsoft.Win32.RegistryView.Registry64, Microsoft.Win32.RegistryView.Registry32 })
+        {
+            foreach (var sub in new[] { @"SOFTWARE\JavaSoft\Java Runtime Environment", @"SOFTWARE\JavaSoft\Java Development Kit" })
+            {
+                try
+                {
+                    using var baseKey = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, view);
+                    using var key = baseKey.OpenSubKey(sub);
+                    if (key == null) continue;
+                    foreach (var version in key.GetSubKeyNames())
+                    {
+                        using var vk = key.OpenSubKey(version);
+                        if (vk?.GetValue("JavaHome") is string home && !string.IsNullOrWhiteSpace(home))
+                            list.Add(Path.Combine(home, "bin", "java.exe"));
+                    }
+                }
+                catch { }
+            }
+        }
+        return list;
     }
 
     private sealed record JavaEntry(string Major, string Source, string Status, string Path);
@@ -724,6 +773,61 @@ public partial class MainWindow : Window
     }
 
     /// <summary>判断版本能否启动：自己的 jar，或继承链根版本（原版）的 jar 存在。</summary>
+    private void InstanceSettings_Click(object sender, RoutedEventArgs e)
+    {
+        string id = SelectedVersionId();
+        if (string.IsNullOrWhiteSpace(id)) { MessageBox.Show("先选一个版本。", "需要选择版本"); return; }
+        _instances.TryGetValue(id, out var current);
+        current ??= new InstanceProfile();
+
+        var win = new Window
+        {
+            Title = "实例设置 · " + id, Width = 480, Height = 380, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = Brushes.White
+        };
+        var panel = new StackPanel { Margin = new Thickness(20) };
+        panel.Children.Add(new TextBlock { Text = "实例设置", FontSize = 20, FontWeight = FontWeights.SemiBold });
+        panel.Children.Add(new TextBlock { Text = id, Foreground = Brushes.Gray, Margin = new Thickness(0, 4, 0, 12) });
+
+        panel.Children.Add(new TextBlock { Text = "这个实例的内存（MB）", Foreground = Brushes.Gray, FontSize = 12 });
+        var memBox = new ComboBox { ItemsSource = new[] { "1024", "2048", "4096", "6144", "8192", "12288", "16384" }, Margin = new Thickness(0, 4, 0, 12), Padding = new Thickness(6) };
+        memBox.SelectedItem = (current.Memory ?? 0) > 0 ? current.Memory.ToString() : "4096";
+        panel.Children.Add(memBox);
+
+        panel.Children.Add(new TextBlock { Text = "这个实例专用的 Java（留空用默认）", Foreground = Brushes.Gray, FontSize = 12 });
+        var javaBox = new TextBox { Text = current.JavaPath ?? "", Margin = new Thickness(0, 4, 0, 8) };
+        panel.Children.Add(javaBox);
+        var pick = new Button { Content = "选择 java.exe", HorizontalAlignment = HorizontalAlignment.Left };
+        pick.Click += (_, __) =>
+        {
+            var dlg = new OpenFileDialog { Filter = "java.exe|java.exe|所有文件|*.*" };
+            if (dlg.ShowDialog() == true) javaBox.Text = dlg.FileName;
+        };
+        panel.Children.Add(pick);
+
+        panel.Children.Add(new TextBlock { Text = "备注", Foreground = Brushes.Gray, FontSize = 12, Margin = new Thickness(0, 12, 0, 0) });
+        var noteBox = new TextBox { Text = current.Note ?? "", Margin = new Thickness(0, 4, 0, 12) };
+        panel.Children.Add(noteBox);
+
+        var save = new Button { Content = "保存", HorizontalAlignment = HorizontalAlignment.Right, Padding = new Thickness(20, 8, 20, 8) };
+        save.Click += (_, __) =>
+        {
+            var profile = new InstanceProfile
+            {
+                Memory = int.TryParse(memBox.SelectedItem?.ToString(), out int mb) ? mb : null,
+                JavaPath = string.IsNullOrWhiteSpace(javaBox.Text) ? null : javaBox.Text.Trim(),
+                Note = string.IsNullOrWhiteSpace(noteBox.Text) ? null : noteBox.Text.Trim()
+            };
+            _instances[id] = profile;
+            try { SaveSettings(); } catch { }
+            Log($"实例设置已保存：{id}（内存 {profile.Memory?.ToString() ?? "默认"}）");
+            win.Close();
+        };
+        panel.Children.Add(save);
+        win.Content = panel;
+        win.ShowDialog();
+    }
+
     private bool VersionLooksInstalled(string id)
     {
         try
@@ -1143,8 +1247,24 @@ public partial class MainWindow : Window
             try { System.Windows.Clipboard.SetText(se.Address); status.Text = "已复制：" + se.Address; } catch { }
         };
 
+        var sync = new Button { Content = "同步到游戏（覆盖 servers.dat）", Margin = new Thickness(8, 0, 0, 0) };
+        sync.Click += (_, __) =>
+        {
+            if (entries.Count == 0) { MessageBox.Show(win, "先添加几个服务器。"); return; }
+            try
+            {
+                string target = Path.Combine(_gameDir, "servers.dat");
+                Directory.CreateDirectory(_gameDir);
+                if (File.Exists(target)) File.Copy(target, target + ".bak-" + DateTime.Now.ToString("yyyyMMddHHmmss"), true);
+                File.WriteAllBytes(target, BuildServersDat(entries));
+                status.Text = "已写入 " + target + "（原文件已备份）";
+                Log("服务器列表已写入 servers.dat：" + entries.Count + " 个");
+            }
+            catch (Exception ex) { MessageBox.Show(win, "写入失败：" + ex.Message); }
+        };
+
         var form = new WrapPanel();
-        form.Children.Add(nameBox); form.Children.Add(addrBox); form.Children.Add(add); form.Children.Add(del); form.Children.Add(copy);
+        form.Children.Add(nameBox); form.Children.Add(addrBox); form.Children.Add(add); form.Children.Add(del); form.Children.Add(copy); form.Children.Add(sync);
         var root = new StackPanel { Margin = new Thickness(18) };
         root.Children.Add(new TextBlock { Text = "服务器收藏", FontSize = 22, FontWeight = FontWeights.SemiBold });
         root.Children.Add(new TextBlock { Text = "这里只做收藏与复制；进游戏后在「多人游戏」里粘贴地址。", Foreground = Brushes.Gray, Margin = new Thickness(0, 6, 0, 0) });
@@ -1152,6 +1272,36 @@ public partial class MainWindow : Window
         win.Content = root;
         Refresh();
         win.ShowDialog();
+    }
+
+    /// <summary>写 Minecraft 的 servers.dat（NBT + gzip）。字符串长度是 NBT 的 ushort，不是 .NET 的 7-bit。</summary>
+    private static byte[] BuildServersDat(List<ServerEntry> servers)
+    {
+        using var ms = new MemoryStream();
+        using (var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionLevel.Optimal, true))
+        using (var w = new BinaryWriter(gz, System.Text.Encoding.UTF8))
+        {
+            void Str(string v)
+            {
+                byte[] b = System.Text.Encoding.UTF8.GetBytes(v);
+                w.Write((short)b.Length);
+                w.Write(b);
+            }
+
+            w.Write((byte)10); Str("");        // root compound
+            w.Write((byte)9); Str("servers");  // list
+            w.Write((byte)10);                 // element: compound
+            w.Write(servers.Count);
+            foreach (var s in servers)
+            {
+                w.Write((byte)8); Str("name"); Str(s.Name);
+                w.Write((byte)8); Str("ip"); Str(s.Address);
+                w.Write((byte)1); Str("acceptTextures"); w.Write((byte)1);
+                w.Write((byte)0);
+            }
+            w.Write((byte)0);                  // end root
+        }
+        return ms.ToArray();
     }
 
     private sealed class ServerEntry
@@ -1163,6 +1313,122 @@ public partial class MainWindow : Window
     }
 
     /// <summary>检查 GitHub 上有没有比当前更新的 release。</summary>
+    private void RemotePanel_Click(object sender, RoutedEventArgs e) => StartRemotePanel();
+
+    private System.Net.Sockets.TcpListener? _remoteListener;
+    private readonly List<string> _recentLogs = new();
+
+    /// <summary>手机遥控面板：电脑上开一个小网页，手机浏览器能看状态、启动游戏、看日志。</summary>
+    private void StartRemotePanel()
+    {
+        if (_remoteListener != null) { MessageBox.Show("面板已经在运行：http://" + LocalIPv4() + ":51234"); return; }
+        try
+        {
+            _remoteListener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Any, 51234);
+            _remoteListener.Start();
+            _ = Task.Run(ServeRemoteAsync);
+            string ip = LocalIPv4();
+            Log("手机遥控面板已启动：http://" + ip + ":51234");
+            MessageBox.Show("手机和电脑连同一个 WiFi，用手机浏览器打开：\n\nhttp://" + ip + ":51234", "手机遥控面板");
+        }
+        catch (Exception ex)
+        {
+            Log("遥控面板启动失败：" + ex.Message);
+            MessageBox.Show("启动失败：" + ex.Message);
+        }
+    }
+
+    private static string LocalIPv4()
+    {
+        try
+        {
+            foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                if (ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+                foreach (var addr in ni.GetIPProperties().UnicastAddresses)
+                    if (addr.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) return addr.Address.ToString();
+            }
+        }
+        catch { }
+        return "127.0.0.1";
+    }
+
+    private async Task ServeRemoteAsync()
+    {
+        var listener = _remoteListener;
+        if (listener == null) return;
+        while (true)
+        {
+            System.Net.Sockets.TcpClient client;
+            try { client = await listener.AcceptTcpClientAsync(); } catch { return; }
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var stream = client.GetStream();
+                    using var reader = new StreamReader(stream, System.Text.Encoding.UTF8, false, 1024, true);
+                    string requestLine = await reader.ReadLineAsync() ?? "";
+                    while (!string.IsNullOrEmpty(await reader.ReadLineAsync())) { }
+                    var parts = requestLine.Split(' ');
+                    string path = parts.Length > 1 ? parts[1] : "/";
+
+                    string body; string contentType = "text/html; charset=utf-8";
+                    if (path.StartsWith("/api/status")) { contentType = "application/json; charset=utf-8"; body = BuildStatusJson(); }
+                    else if (path.StartsWith("/api/launch"))
+                    {
+                        contentType = "application/json; charset=utf-8";
+                        string id = path.Contains("id=") ? Uri.UnescapeDataString(path[(path.IndexOf("id=") + 3)..]) : "";
+                        Dispatcher.BeginInvoke(() => LaunchFromRemote(id));
+                        body = "{\"ok\":true}";
+                    }
+                    else body = RemotePanelHtml();
+
+                    byte[] payload = System.Text.Encoding.UTF8.GetBytes(body);
+                    byte[] head = System.Text.Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Type: " + contentType + "\r\nContent-Length: " + payload.Length + "\r\nConnection: close\r\n\r\n");
+                    await stream.WriteAsync(head);
+                    await stream.WriteAsync(payload);
+                }
+                catch { }
+                finally { try { client.Dispose(); } catch { } }
+            });
+        }
+    }
+
+    private void LaunchFromRemote(string id)
+    {
+        try
+        {
+            var row = _versions.FirstOrDefault(v => string.Equals(v.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (row == null) { Log("遥控：没有这个版本 " + id); return; }
+            VersionsList.SelectedItem = row;
+            Launch_Click(this, new RoutedEventArgs());
+        }
+        catch (Exception ex) { Log("遥控启动失败：" + ex.Message); }
+    }
+
+    private string BuildStatusJson() => JsonSerializer.Serialize(new
+    {
+        version = SelectedVersionId(),
+        versions = _versions.Select(v => v.Id).Take(50).ToArray(),
+        logs = _recentLogs.TakeLast(40).ToArray()
+    });
+
+    private string RemotePanelHtml() => "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
+        + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>X 启动器 · 手机遥控</title>"
+        + "<style>body{font-family:system-ui,sans-serif;background:#f5f6f8;margin:0;padding:16px;color:#1f2430}"
+        + "h1{font-size:18px;margin:0 0 12px}.card{background:#fff;border:1px solid #e9ecf2;border-radius:12px;padding:14px;margin-bottom:12px}"
+        + "select,button{font-size:15px;padding:10px;border-radius:8px;border:1px solid #dde3ec;width:100%}"
+        + "button{background:#3a6fe0;color:#fff;border:0;margin-top:10px}"
+        + "pre{font-size:12px;background:#fbfcfe;padding:10px;border-radius:8px;overflow:auto;max-height:45vh;white-space:pre-wrap}</style></head><body>"
+        + "<h1>X 启动器 · 手机遥控</h1><div class=\"card\"><select id=\"v\"></select><button onclick=\"launch()\">启动游戏</button></div>"
+        + "<div class=\"card\"><pre id=\"log\">加载中…</pre></div><script>"
+        + "async function refresh(){const r=await fetch('/api/status');const d=await r.json();const sel=document.getElementById('v');"
+        + "if(!sel.dataset.done){sel.innerHTML=d.versions.map(x=>'<option'+(x===d.version?' selected':'')+'>'+x+'</option>').join('');sel.dataset.done=1;}"
+        + "document.getElementById('log').textContent=(d.logs||[]).join('\n')||'（暂无日志）';}"
+        + "async function launch(){const id=document.getElementById('v').value;await fetch('/api/launch?id='+encodeURIComponent(id));setTimeout(refresh,1500);}"
+        + "refresh();setInterval(refresh,3000);</script></body></html>";
+
     private async void CheckUpdate_Click(object sender, RoutedEventArgs e)
     {
         try
@@ -1177,7 +1443,31 @@ public partial class MainWindow : Window
             string url = doc.RootElement.TryGetProperty("html_url", out var h) ? h.GetString() ?? "" : "";
             string current = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0";
             SetStatus($"最新版本：{tag}（当前 {current}）");
-            var result = MessageBox.Show($"最新发布：{tag}\n当前版本：{current}\n\n要打开下载页面吗？", "检查更新", MessageBoxButton.YesNo, MessageBoxImage.Information);
+            string? assetUrl = null;
+            if (doc.RootElement.TryGetProperty("assets", out var assets))
+                assetUrl = assets.EnumerateArray()
+                    .Where(a => (a.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "").EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    .Select(a => a.TryGetProperty("browser_download_url", out var d) ? d.GetString() : null)
+                    .FirstOrDefault();
+
+            if (!string.IsNullOrWhiteSpace(assetUrl))
+            {
+                if (MessageBox.Show($"发现新版本 {tag}（当前 {current}）。\n\n要现在下载并自动替换当前程序吗？\n替换后启动器会自己重启。", "自动更新",
+                        MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+                SetStatus("正在下载新版本……");
+                string temp = Path.Combine(Path.GetTempPath(), "XLauncher-update.exe");
+                await DownloadAndVerifyAsync(assetUrl!, temp, null, null);
+                string currentExe = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                if (string.IsNullOrWhiteSpace(currentExe)) throw new InvalidOperationException("拿不到当前程序路径，无法自动替换。");
+                string bat = Path.Combine(Path.GetTempPath(), "xlauncher-update.bat");
+                File.WriteAllText(bat,
+                    "@echo off\r\ntimeout /t 2 >nul\r\nmove /y \"" + temp + "\" \"" + currentExe + "\" >nul\r\nstart \"\" \"" + currentExe + "\"\r\ndel \"%~f0\"\r\n");
+                Process.Start(new ProcessStartInfo(bat) { UseShellExecute = true, CreateNoWindow = true });
+                Application.Current.Shutdown();
+                return;
+            }
+
+            var result = MessageBox.Show($"最新发布：{tag}\n当前版本：{current}\n\n这个 release 没有可直接替换的 exe，要打开下载页面吗？", "检查更新", MessageBoxButton.YesNo, MessageBoxImage.Information);
             if (result == MessageBoxResult.Yes && !string.IsNullOrWhiteSpace(url))
                 Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
         }
@@ -1828,32 +2118,176 @@ public partial class MainWindow : Window
                 await Task.Delay(Math.Max(5, interval) * 1000);
                 using var poll = await Http.PostAsync("https://login.microsoftonline.com/consumers/oauth2/v2.0/token", new FormUrlEncodedContent(new Dictionary<string,string> { ["grant_type"] = "urn:ietf:params:oauth:grant-type:device_code", ["client_id"] = clientId, ["device_code"] = code }));
                 var resultText = await poll.Content.ReadAsStringAsync(); using var result = JsonDocument.Parse(resultText);
-                if (poll.IsSuccessStatusCode) { msToken = result.RootElement.GetProperty("access_token").GetString(); break; }
+                if (poll.IsSuccessStatusCode) { msToken = result.RootElement.GetProperty("access_token").GetString(); if (result.RootElement.TryGetProperty("refresh_token", out var rt)) _refreshToken = rt.GetString(); break; }
                 string error = result.RootElement.TryGetProperty("error", out var er) ? er.GetString() ?? "" : "";
                 if (error == "authorization_pending") continue;
                 if (error == "slow_down") { interval += 5; continue; }
                 throw new Exception(resultText);
             }
             if (msToken == null) throw new TimeoutException("Microsoft 登录超时。");
-            var xbl = await PostJsonAsync("https://user.auth.xboxlive.com/user/authenticate", new { Properties = new { AuthMethod="RPS", SiteName="user.auth.xboxlive.com", RpsTicket="d=" + msToken }, RelyingParty="http://auth.xboxlive.com", TokenType="JWT" });
-            string xblToken = xbl.GetProperty("Token").GetString()!; string userHash = xbl.GetProperty("DisplayClaims").GetProperty("xui")[0].GetProperty("uhs").GetString()!;
-            var xsts = await PostJsonAsync("https://xsts.auth.xboxlive.com/xsts/authorize", new { Properties = new { SandboxId="RETAIL", UserTokens = new[] { xblToken } }, RelyingParty="rp://api.minecraftservices.com/", TokenType="JWT" });
-            string xstsToken = xsts.GetProperty("Token").GetString()!;
-            using var mcResp = await Http.PostAsJsonAsync("https://api.minecraftservices.com/authentication/login_with_xbox", new { identityToken = $"XBL3.0 x={userHash};{xstsToken}" });
-            using var mcDoc = JsonDocument.Parse(await mcResp.Content.ReadAsStringAsync()); mcResp.EnsureSuccessStatusCode();
-            _accessToken = mcDoc.RootElement.GetProperty("access_token").GetString();
-            _offlineMode = false;
-            // The profile endpoint verifies ownership of a Java profile before allowing launch.
-            using var profileRequest = new HttpRequestMessage(HttpMethod.Get, "https://api.minecraftservices.com/minecraft/profile");
-            profileRequest.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _accessToken);
-            using var profileResp = await Http.SendAsync(profileRequest);
-            using var profile = JsonDocument.Parse(await profileResp.Content.ReadAsStringAsync()); profileResp.EnsureSuccessStatusCode();
-            _uuid = profile.RootElement.GetProperty("id").GetString(); _username = profile.RootElement.GetProperty("name").GetString(); _userType = "msa"; _offlineMode = false;
-            PlayerNameText.Text = _username; AccountStatusText.Text = "已登录正版 · " + _username;
-            UpdateLaunchAvailability();
-            Log("Microsoft → Xbox Live → XSTS → Minecraft Services 认证成功；已获取 Java Profile。"); SetStatus("正版账号认证成功。");
+            await CompleteSignInAsync(msToken!);
+            SaveAccount();
         }
         catch (Exception ex) { _accessToken = null; _offlineMode = false; UpdateLaunchAvailability(); AccountStatusText.Text = "登录失败"; SetStatus("认证失败：" + ex.Message); Log("认证失败：" + ex); MessageBox.Show(ex.Message, "登录失败"); }
+    }
+
+    /// <summary>从 MSA token 走完 Xbox Live → XSTS → Minecraft Services，拿到 Java Profile。</summary>
+    private async Task CompleteSignInAsync(string msToken)
+    {
+        var xbl = await PostJsonAsync("https://user.auth.xboxlive.com/user/authenticate", new { Properties = new { AuthMethod="RPS", SiteName="user.auth.xboxlive.com", RpsTicket="d=" + msToken }, RelyingParty="http://auth.xboxlive.com", TokenType="JWT" });
+        string xblToken = xbl.GetProperty("Token").GetString()!;
+        string userHash = xbl.GetProperty("DisplayClaims").GetProperty("xui")[0].GetProperty("uhs").GetString()!;
+        var xsts = await PostJsonAsync("https://xsts.auth.xboxlive.com/xsts/authorize", new { Properties = new { SandboxId="RETAIL", UserTokens = new[] { xblToken } }, RelyingParty="rp://api.minecraftservices.com/", TokenType="JWT" });
+        string xstsToken = xsts.GetProperty("Token").GetString()!;
+        using var mcResp = await Http.PostAsJsonAsync("https://api.minecraftservices.com/authentication/login_with_xbox", new { identityToken = $"XBL3.0 x={userHash};{xstsToken}" });
+        using var mcDoc = JsonDocument.Parse(await mcResp.Content.ReadAsStringAsync()); mcResp.EnsureSuccessStatusCode();
+        _accessToken = mcDoc.RootElement.GetProperty("access_token").GetString();
+        using var profileRequest = new HttpRequestMessage(HttpMethod.Get, "https://api.minecraftservices.com/minecraft/profile");
+        profileRequest.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _accessToken);
+        using var profileResp = await Http.SendAsync(profileRequest);
+        using var profile = JsonDocument.Parse(await profileResp.Content.ReadAsStringAsync()); profileResp.EnsureSuccessStatusCode();
+        _uuid = profile.RootElement.GetProperty("id").GetString();
+        _username = profile.RootElement.GetProperty("name").GetString();
+        _userType = "msa"; _offlineMode = false;
+        PlayerNameText.Text = _username;
+        AccountStatusText.Text = "已登录正版 · " + _username;
+        UpdateLaunchAvailability();
+        Log("Microsoft → Xbox Live → XSTS → Minecraft Services 认证成功；已获取 Java Profile。");
+        SetStatus("正版账号认证成功。");
+    }
+
+    private string AccountPath => Path.Combine(Path.GetDirectoryName(SettingsPath)!, "account.bin");
+
+    /// <summary>刷新令牌用 DPAPI 加密存盘，下次启动免登录。</summary>
+    private void SaveAccount()
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_refreshToken) || string.IsNullOrWhiteSpace(_uuid)) return;
+            string payload = JsonSerializer.Serialize(new { refreshToken = _refreshToken, uuid = _uuid, name = _username, userType = _userType });
+            byte[] bytes = System.Security.Cryptography.ProtectedData.Protect(
+                System.Text.Encoding.UTF8.GetBytes(payload), null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+            Directory.CreateDirectory(Path.GetDirectoryName(AccountPath)!);
+            File.WriteAllBytes(AccountPath, bytes);
+            Log("账号凭据已加密保存。");
+        }
+        catch (Exception ex) { Log("保存账号失败：" + ex.Message); }
+    }
+
+    private sealed record SavedAccount(string RefreshToken, string Uuid, string? Name);
+
+    private SavedAccount? LoadAccount()
+    {
+        try
+        {
+            if (!File.Exists(AccountPath)) return null;
+            byte[] bytes = System.Security.Cryptography.ProtectedData.Unprotect(
+                File.ReadAllBytes(AccountPath), null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+            using var doc = JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(bytes));
+            string? rt = doc.RootElement.TryGetProperty("refreshToken", out var r) ? r.GetString() : null;
+            string? uuid = doc.RootElement.TryGetProperty("uuid", out var u) ? u.GetString() : null;
+            string? name = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() : null;
+            if (string.IsNullOrWhiteSpace(rt) || string.IsNullOrWhiteSpace(uuid)) return null;
+            return new SavedAccount(rt!, uuid!, name);
+        }
+        catch { return null; }
+    }
+
+    private void ClearAccount()
+    {
+        try { if (File.Exists(AccountPath)) File.Delete(AccountPath); } catch { }
+    }
+
+    /// <summary>启动时用刷新令牌静默恢复正版账号。</summary>
+    private async Task RestoreAccountAsync()
+    {
+        var saved = LoadAccount();
+        if (saved == null) return;
+        string clientId = OAuthClientIdText.Text.Trim();
+        if (string.IsNullOrWhiteSpace(clientId)) { Log("已保存账号，但设置里没有 OAuth Client ID，无法自动恢复。"); return; }
+        try
+        {
+            SetStatus("正在恢复上次的账号……");
+            using var resp = await Http.PostAsync("https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                new FormUrlEncodedContent(new Dictionary<string, string>
+                {
+                    ["grant_type"] = "refresh_token",
+                    ["client_id"] = clientId,
+                    ["refresh_token"] = saved.RefreshToken,
+                    ["scope"] = "XboxLive.signin offline_access"
+                }));
+            string text = await resp.Content.ReadAsStringAsync();
+            if (!resp.IsSuccessStatusCode) { Log("刷新令牌失效，需要重新登录。"); return; }
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.TryGetProperty("refresh_token", out var rt)) _refreshToken = rt.GetString();
+            else _refreshToken = saved.RefreshToken;
+            await CompleteSignInAsync(doc.RootElement.GetProperty("access_token").GetString()!);
+            SaveAccount();
+            Log("已自动恢复微软账号：" + _username);
+        }
+        catch (Exception ex)
+        {
+            Log("自动恢复账号失败：" + ex.Message);
+            SetStatus("账号自动恢复失败，可以手动重新登录。");
+        }
+    }
+
+    /// <summary>记录一次启动结果，用于下次判断要不要进安全模式。</summary>
+    private string LaunchStampPath(string versionId) => Path.Combine(_gameDir, "versions", versionId, "xlauncher-last-launch.json");
+
+    private void MarkLaunch(string versionId, bool ok)
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(LaunchStampPath(versionId))!;
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(LaunchStampPath(versionId), JsonSerializer.Serialize(new { ok, at = DateTime.Now }));
+        }
+        catch { }
+    }
+
+    private bool LastLaunchFailed(string versionId)
+    {
+        try
+        {
+            string path = LaunchStampPath(versionId);
+            if (!File.Exists(path)) return false;
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            return doc.RootElement.TryGetProperty("ok", out var ok) && !ok.GetBoolean();
+        }
+        catch { return false; }
+    }
+
+    /// <summary>安全模式：把 mods 改名，游戏就不加载模组；进程退出后自动改回来。</summary>
+    private string? DisableModsForSafeMode(string versionId)
+    {
+        try
+        {
+            string mods = Path.Combine(GameDirForVersion(versionId), "mods");
+            if (!Directory.Exists(mods)) return null;
+            string moved = mods + ".safe-" + DateTime.Now.ToString("HHmmss");
+            Directory.Move(mods, moved);
+            Directory.CreateDirectory(mods);
+            Log("安全模式：mods 已临时改名 → " + Path.GetFileName(moved));
+            return moved;
+        }
+        catch (Exception ex) { Log("安全模式改名失败：" + ex.Message); return null; }
+    }
+
+    private void RestoreModsAfterSafeMode(string versionId, string? movedDir)
+    {
+        if (string.IsNullOrWhiteSpace(movedDir)) return;
+        try
+        {
+            string mods = Path.Combine(GameDirForVersion(versionId), "mods");
+            if (Directory.Exists(movedDir))
+            {
+                if (Directory.Exists(mods) && !Directory.EnumerateFileSystemEntries(mods).Any()) Directory.Delete(mods, true);
+                Directory.Move(movedDir, mods);
+                Log("安全模式结束，mods 已还原。");
+            }
+        }
+        catch (Exception ex) { Log("还原 mods 失败：" + ex.Message + "，手动改名回来即可：" + movedDir); }
     }
 
     private void OfflineLogin_Click(object sender, RoutedEventArgs e)
@@ -1879,7 +2313,7 @@ public partial class MainWindow : Window
 
     private void Logout_Click(object sender, RoutedEventArgs e)
     {
-        _accessToken = null; _uuid = null; _username = null; _userType = null; _offlineMode = false;
+        _accessToken = null; _uuid = null; _username = null; _userType = null; _offlineMode = false; _refreshToken = null; ClearAccount();
         AccountStatusText.Text = "未登录";
         UpdateLaunchAvailability();
         SetStatus("已退出当前账户。请选择微软正版登录或离线本地账户。");
@@ -1941,10 +2375,17 @@ public partial class MainWindow : Window
             string jarPath = Path.Combine(_gameDir, "versions", rootId, rootId + ".jar");
             if (!File.Exists(jarPath)) throw new FileNotFoundException($"缺少原版客户端 {rootId}.jar，请先安装这个原版版本。");
             int javaMajor = meta.TryGetProperty("javaVersion", out var jv) && jv.TryGetProperty("majorVersion", out var jm) ? jm.GetInt32() : GuessJavaMajor(selected.Id);
+            _instances.TryGetValue(selected.Id, out var inst);
             string java;
             try
             {
-                if (_versionJavaPaths.TryGetValue(selected.Id, out var assigned) && !string.IsNullOrWhiteSpace(assigned))
+                if (inst?.JavaPath is string instJava && File.Exists(instJava))
+                {
+                    if (!IsJavaCompatible(instJava, javaMajor))
+                        throw new FileNotFoundException($"实例设置的 Java 与要求的主版本不符（需要 Java {javaMajor}）：{instJava}");
+                    java = instJava;
+                }
+                else if (_versionJavaPaths.TryGetValue(selected.Id, out var assigned) && !string.IsNullOrWhiteSpace(assigned))
                 {
                     if (!File.Exists(assigned) || !IsJavaCompatible(assigned, javaMajor))
                         throw new FileNotFoundException($"版本 {selected.Id} 指定的 Java 不存在或版本不兼容（需要 Java {javaMajor}+）：{assigned}");
@@ -1960,13 +2401,42 @@ public partial class MainWindow : Window
                 SaveSettings();
             }
             Log($"版本 {selected.Id} 使用 Java {javaMajor}：{java}");
+
+            // 上次启动失败过 → 提议安全模式（临时禁用模组）
+            string? safeModsMoved = null;
+            if (LastLaunchFailed(selected.Id))
+            {
+                var choice = MessageBox.Show(
+                    $"上次启动 {selected.Id} 似乎没有成功。\n\n要用安全模式启动吗？（临时把 mods 文件夹改名，游戏不加载模组，退出后自动还原）",
+                    "安全模式", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (choice == MessageBoxResult.Yes) safeModsMoved = DisableModsForSafeMode(selected.Id);
+            }
             string natives = Path.Combine(_gameDir, "versions", rootId, "natives");
+
+            // 启动前自检：PCL 也是先把明显会出问题的配置挡住，再谈启动。
+            var warnings = new List<string>();
+            int memMb = GetMemory();
+            if (TotalRamBytes > 0 && memMb * 1024L * 1024L > TotalRamBytes * 0.75)
+                warnings.Add($"分配内存 {memMb} MB 超过物理内存的 75%（本机约 {Math.Max(1, TotalRamBytes / 1024 / 1024 / 1024)} GB），系统可能卡死。");
+            if (java.Contains("Program Files (x86)", StringComparison.OrdinalIgnoreCase))
+                warnings.Add("当前 Java 是 32 位的，内存最多约 1 GB，大型模组包建议换 64 位 Java。");
+            try
+            {
+                if (!Directory.Exists(natives) || Directory.GetFiles(natives).Length == 0)
+                    warnings.Add("natives 目录为空，缺少原生库，游戏可能直接崩溃；重新安装一次这个版本可以修复。");
+            }
+            catch { }
+            if (warnings.Count > 0)
+            {
+                string text = "启动前检查发现这些问题：\n\n" + string.Join("\n", warnings.Select((w, i) => $"{i + 1}. {w}")) + "\n\n仍要继续启动吗？";
+                if (MessageBox.Show(text, "启动前检查", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+            }
             var cp = new List<string>(); if (meta.TryGetProperty("libraries", out var libs)) foreach (var lib in libs.EnumerateArray()) if (IsAllowed(lib) && lib.TryGetProperty("downloads", out var dl) && dl.TryGetProperty("artifact", out var art)) { var lp = ResolveLibraryPath(art); if (lp != null && File.Exists(lp)) cp.Add(lp); }
             cp.Add(jarPath);
             string assetIndex = meta.TryGetProperty("assetIndex", out var ai) ? ai.GetProperty("id").GetString()! : selected.Id;
             var vars = new Dictionary<string,string> { ["${natives_directory}"]=natives, ["${launcher_name}"]="MCLauncherRevival", ["${launcher_version}"]="1.2", ["${classpath}"]=string.Join(Path.PathSeparator,cp), ["${classpath_separator}"]=Path.PathSeparator.ToString(), ["${library_directory}"]=Path.Combine(_gameDir,"libraries"), ["${auth_player_name}"]=_username, ["${version_name}"]=selected.Id, ["${game_directory}"]=GameDirForVersion(selected.Id), ["${assets_root}"]=Path.Combine(_gameDir,"assets"), ["${assets_index_name}"]=assetIndex, ["${auth_uuid}"]=_uuid, ["${auth_access_token}"]=_accessToken!, ["${user_type}"]=_userType ?? "legacy", ["${version_type}"]=meta.TryGetProperty("type",out var typ)?typ.GetString()!:"release", ["${user_properties}"]="{}", ["${clientid}"]="", ["${auth_xuid}"]="", ["${auth_session}"]=_accessToken!, ["${game_assets}"]=Path.Combine(_gameDir,"assets","virtual","legacy"), ["${resolution_width}"]="854", ["${resolution_height}"]="480" };
             var args = new List<string>();
-            if (meta.TryGetProperty("arguments", out var arguments)) { args.Add("-Xmx"+GetMemory()+"M"); args.Add("-Djava.library.path="+natives); AddArguments(arguments,"jvm",args,vars); if(meta.TryGetProperty("mainClass",out var mc)) args.Add(mc.GetString()!); AddArguments(arguments,"game",args,vars); }
+            if (meta.TryGetProperty("arguments", out var arguments)) { args.Add("-Xmx"+GetMemoryFor(selected.Id)+"M"); args.AddRange(JvmTuningArgs(javaMajor)); args.Add("-Djava.library.path="+natives); AddArguments(arguments,"jvm",args,vars); if(meta.TryGetProperty("mainClass",out var mc)) args.Add(mc.GetString()!); AddArguments(arguments,"game",args,vars); }
             else
             {
                 args.Add("-Djava.library.path=" + natives); args.Add("-cp"); args.Add(vars["${classpath}"]); args.Add("-Xmx" + GetMemory() + "M");
@@ -1992,7 +2462,26 @@ public partial class MainWindow : Window
             var psi = new ProcessStartInfo(java) { WorkingDirectory=GameDirForVersion(selected.Id), UseShellExecute=false };
             foreach(var a in args) psi.ArgumentList.Add(a);
             Log("启动命令："+java+" "+string.Join(" ",args.Select(a=>a.Contains(' ')?"[带空格参数]":a)));
-            var proc=Process.Start(psi) ?? throw new Exception("Java 进程未能启动。"); SetStatus((_offlineMode ? "Minecraft 已通过离线模式启动，进程 PID=" : "Minecraft 已启动，进程 PID=")+proc.Id); Log("Minecraft 进程已启动 PID="+proc.Id+(_offlineMode?"（离线身份）":"（正版身份）"));
+            MarkLaunch(selected.Id, false);
+            var proc=Process.Start(psi) ?? throw new Exception("Java 进程未能启动。");
+            if (safeModsMoved != null)
+            {
+                try
+                {
+                    string moved = safeModsMoved;
+                    proc.EnableRaisingEvents = true;
+                    proc.Exited += (_, __) => RestoreModsAfterSafeMode(selected.Id, moved);
+                }
+                catch { }
+            }
+            // 进程活过一分钟就算这次启动成功，下次不再提示安全模式。
+            {
+                string launchId = selected.Id;
+                _ = Task.Run(async () =>
+                {
+                    try { await Task.Delay(TimeSpan.FromSeconds(60)); if (!proc.HasExited) MarkLaunch(launchId, true); } catch { }
+                });
+            } SetStatus((_offlineMode ? "Minecraft 已通过离线模式启动，进程 PID=" : "Minecraft 已启动，进程 PID=")+proc.Id); Log("Minecraft 进程已启动 PID="+proc.Id+(_offlineMode?"（离线身份）":"（正版身份）"));
         }
         catch(Exception ex) { SetStatus("启动失败："+ex.Message); Log("启动失败："+ex); MessageBox.Show(ex.Message,"启动失败"); }
     }
@@ -2015,6 +2504,10 @@ public partial class MainWindow : Window
     }
     private int GetMemory() => MemoryCombo.SelectedItem is ComboBoxItem item && int.TryParse(item.Content?.ToString(),out int mb) ? mb : MemoryOptions[2];
 
+    /// <summary>取某个版本实际使用的内存：实例设置优先，其次全局。</summary>
+    private int GetMemoryFor(string versionId)
+        => _instances.TryGetValue(versionId, out var p) && p.Memory.HasValue ? p.Memory.Value : GetMemory();
+
     /// <summary>第一次运行时按物理内存给个安全默认值：4 GB 及以下给 2048，其它给 4096。</summary>
     private void ApplyRecommendedMemory()
     {
@@ -2023,6 +2516,24 @@ public partial class MainWindow : Window
     }
 
     /// <summary>把内存值映射成下拉框下标；未知值回落到默认 4096，不再被 Math.Clamp 截成 1024/8192。</summary>
+    /// <summary>按 Java 主版本给一套稳妥的 JVM 参数；PCL 也是这么处理「装完就卡」的问题。</summary>
+    private static IEnumerable<string> JvmTuningArgs(int javaMajor)
+    {
+        if (javaMajor >= 9)
+        {
+            yield return "-XX:+UseG1GC";
+            yield return "-XX:G1NewSizePercent=20";
+            yield return "-XX:G1ReservePercent=20";
+            yield return "-XX:MaxGCPauseMillis=50";
+            yield return "-XX:G1HeapRegionSize=32M";
+        }
+        else if (javaMajor >= 8)
+        {
+            yield return "-XX:+UseG1GC";
+        }
+        yield return "-Dfile.encoding=UTF-8";
+    }
+
     private static int MemoryIndex(string? text)
     {
         int mb = int.TryParse(text, out int parsed) ? parsed : MemoryOptions[2];
@@ -2291,8 +2802,8 @@ public partial class MainWindow : Window
     }
 
     private string SettingsPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XLauncher", "settings.json");
-    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("autoCheckInstalled",out var ac)) _autoCheckInstalled=ac.ValueKind==JsonValueKind.True; if(r.TryGetProperty("autoJavaOnInstall",out var aj)) AutoJavaCheck.IsChecked=aj.ValueKind==JsonValueKind.True; if(r.TryGetProperty("isolatedVersions",out var iv)&&iv.ValueKind==JsonValueKind.Array) { _isolatedVersions.Clear(); foreach(var e in iv.EnumerateArray()) if(e.GetString() is string sid) _isolatedVersions.Add(sid); } if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=MemoryIndex(mem.ToString()); if(r.TryGetProperty("versionJavaPaths",out var mappings)&&mappings.ValueKind==JsonValueKind.Object) _versionJavaPaths=mappings.EnumerateObject().Where(x=>x.Value.ValueKind==JsonValueKind.String).ToDictionary(x=>x.Name,x=>x.Value.GetString()!,StringComparer.OrdinalIgnoreCase); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
-    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString(), autoCheckInstalled=_autoCheckInstalled, autoJavaOnInstall=AutoJavaCheck.IsChecked==true, isolatedVersions=_isolatedVersions.ToArray(), versionJavaPaths=_versionJavaPaths }, new JsonSerializerOptions { WriteIndented=true })); }
+    private void LoadSavedSettings() { try { if (!File.Exists(SettingsPath)) return; using var d = JsonDocument.Parse(File.ReadAllText(SettingsPath)); var r=d.RootElement; if(r.TryGetProperty("gameDir",out var gd)&&Directory.Exists(gd.GetString())) { _gameDir=gd.GetString()!; GameDirectoryText.Text=_gameDir; } if(r.TryGetProperty("javaPath",out var jp)) _javaPath=jp.GetString(); if(r.TryGetProperty("oauthClientId",out var oc)) OAuthClientIdText.Text=oc.GetString()??""; if(r.TryGetProperty("autoCheckInstalled",out var ac)) _autoCheckInstalled=ac.ValueKind==JsonValueKind.True; if(r.TryGetProperty("autoJavaOnInstall",out var aj)) AutoJavaCheck.IsChecked=aj.ValueKind==JsonValueKind.True; if(r.TryGetProperty("instances",out var insts)&&insts.ValueKind==JsonValueKind.Object) _instances=JsonSerializer.Deserialize<Dictionary<string,InstanceProfile>>(insts.GetRawText())??new(); if(r.TryGetProperty("isolatedVersions",out var iv)&&iv.ValueKind==JsonValueKind.Array) { _isolatedVersions.Clear(); foreach(var e in iv.EnumerateArray()) if(e.GetString() is string sid) _isolatedVersions.Add(sid); } if(r.TryGetProperty("memory",out var mm)&&int.TryParse(mm.GetString(),out var mem)) MemoryCombo.SelectedIndex=MemoryIndex(mem.ToString()); if(r.TryGetProperty("versionJavaPaths",out var mappings)&&mappings.ValueKind==JsonValueKind.Object) _versionJavaPaths=mappings.EnumerateObject().Where(x=>x.Value.ValueKind==JsonValueKind.String).ToDictionary(x=>x.Name,x=>x.Value.GetString()!,StringComparer.OrdinalIgnoreCase); } catch(Exception ex) { Log("读取设置失败："+ex.Message); } }
+    private void SaveSettings() { Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!); File.WriteAllText(SettingsPath, JsonSerializer.Serialize(new { gameDir=_gameDir, javaPath=_javaPath, oauthClientId=OAuthClientIdText.Text, memory=GetMemory().ToString(), autoCheckInstalled=_autoCheckInstalled, autoJavaOnInstall=AutoJavaCheck.IsChecked==true, isolatedVersions=_isolatedVersions.ToArray(), instances=_instances, versionJavaPaths=_versionJavaPaths }, new JsonSerializerOptions { WriteIndented=true })); }
 
     private void DownloadPage_Click(object sender, RoutedEventArgs e)
     {

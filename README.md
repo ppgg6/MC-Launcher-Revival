@@ -1,4 +1,4 @@
-# X Launcher v4.5.0-preview4 开发版
+# X Launcher v5.0.0-preview3 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -195,3 +195,36 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - **服务器收藏**：侧栏入口，地址存在 `xlauncher-servers.json`，支持添加/删除/复制地址（进游戏后粘贴到「多人游戏」）。
 - **检查更新**：读 GitHub 最新 release 的 tag 与当前版本对比，可直接打开下载页。
 - **界面**：卡片加柔和投影，侧栏补齐新入口。
+
+
+
+## v4.5.0-preview5：兼容性与优化（借鉴 PCL 思路）
+
+- **Java 探测更全**：除 PATH / JAVA_HOME / 启动器 runtime 外，再读注册表（HKLM JavaSoft，64/32 位都查）与常见厂商目录（Oracle Java、Adoptium、Zulu、Microsoft、BellSoft、Corretto、Semeru）。
+- **JVM 参数自动调优**：Java 9+ 自动加 G1GC 一组参数（G1NewSizePercent=20、G1ReservePercent=20、MaxGCPauseMillis=50、G1HeapRegionSize=32M），Java 8 加 `-XX:+UseG1GC`，统一加 `-Dfile.encoding=UTF-8`（中文日志不乱码）。
+- **启动前自检**：内存分配超过物理内存 75%、Java 是 32 位、natives 目录为空，这三种情况先弹窗警告再让你决定是否继续。
+
+
+
+## v5.0.0-preview1：账号持久化与安全模式
+
+- **账号持久化**：微软登录后把 refresh_token 用 DPAPI（当前用户）加密存到 `%AppData%/XLauncher/account.bin`，下次启动自动静默刷新，不用每次重新登录；退出登录会同时删除凭据。
+- **安全模式**：启动前若发现「上次启动没成功」（进程 60 秒内退出），会提示是否用安全模式启动 —— 临时把 `mods` 改名为 `mods.safe-<时间>`，游戏退出后自动还原，用来判断是不是模组把游戏搞崩的。
+- 启动结果记录在 `versions/<id>/xlauncher-last-launch.json`。
+
+
+
+## v5.0.0-preview2：手机遥控面板
+
+- 侧栏新增「手机遥控」：在电脑上起一个本地小网页（端口 51234），手机连同一个 WiFi，浏览器打开弹出的地址即可。
+- 手机页面能：查看已安装版本、选择版本并**启动游戏**、实时查看启动器日志（每 3 秒刷新）。
+- 实现是内嵌的 TCP + 极简 HTTP，不依赖管理员权限或 URL 保留，不装任何运行时。
+- 注意：这是「手机遥控电脑上的启动器」，不是手机本地跑 Minecraft（那需要 Android 上的 JRE 与图形转译层，属于另一个工程）。
+
+
+
+## v5.0.0-preview3：实例化 / 自动更新 / servers.dat
+
+- **实例设置**：每个版本可以单独指定内存、专用 Java、备注（存进 settings.json 的 `instances`），启动时实例设置优先于全局。
+- **自动更新**：检查更新时如果 release 里带 `.exe` 资产，会下载后用批处理替换当前程序并重启（没有资产则回落到打开下载页）。
+- **写入服务器列表**：服务器收藏窗口新增「同步到游戏」，把收藏写成 `servers.dat`（NBT + gzip，写入前自动备份原文件），进游戏就能在多人列表里看到。

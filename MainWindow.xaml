@@ -175,6 +175,7 @@
     <StackPanel DockPanel.Dock="Bottom">
      <Border Height="1" Background="{StaticResource Line}" Margin="6,0,6,12"/>
      <Button Style="{StaticResource NavButton}" Content="启动器设置" Click="Settings_Click"/>
+     <Button Style="{StaticResource NavButton}" Content="手机遥控" Click="RemotePanel_Click"/>
      <Button Style="{StaticResource NavButton}" Content="检查更新" Click="CheckUpdate_Click"/>
      <Button Style="{StaticResource NavButton}" Content="打开游戏目录" Click="OpenDirectory_Click"/>
      <TextBlock Text="独立第三方项目 · 非官方" FontSize="10" Foreground="#AEB6C2" Margin="12,10,0,0"/>
@@ -265,6 +266,7 @@
          <Button Content="安装 Fabric" Margin="8,0,0,0" Click="InstallFabric_Click"/>
          <Button Content="安装 Forge" Margin="8,0,0,0" Click="InstallForge_Click"/>
          <Button Content="删除版本" Margin="8,0,0,0" Click="DeleteVersion_Click"/>
+         <Button Content="实例设置" Margin="8,0,0,0" Click="InstanceSettings_Click"/>
          <Button Content="安装 NeoForge" Margin="8,0,0,0" Click="InstallNeoForge_Click"/>
          <Button Content="崩溃分析" Margin="8,0,0,0" Click="CrashAnalyze_Click"/>
          <Button Content="导入整合包" Margin="8,0,0,0" Click="ImportModpack_Click"/>
