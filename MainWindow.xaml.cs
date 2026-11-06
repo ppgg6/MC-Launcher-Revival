@@ -1086,7 +1086,7 @@ public partial class MainWindow : Window
                 await DownloadAndVerifyAsync(urls[0], dest, sha1, size);
                 done++;
                 SetStatus($"整合包 {packName}：{done}/{files.Count} 个文件");
-                Dispatcher.BeginInvoke(() => Progress.Value = files.Count == 0 ? 90 : 90.0 * done / files.Count);
+                _ = Dispatcher.BeginInvoke(() => Progress.Value = files.Count == 0 ? 90 : 90.0 * done / files.Count);
             }
 
             string overrides = Path.Combine(temp, "overrides");
@@ -1379,7 +1379,7 @@ public partial class MainWindow : Window
                     {
                         contentType = "application/json; charset=utf-8";
                         string id = path.Contains("id=") ? Uri.UnescapeDataString(path[(path.IndexOf("id=") + 3)..]) : "";
-                        Dispatcher.BeginInvoke(() => LaunchFromRemote(id));
+                        _ = Dispatcher.BeginInvoke(() => LaunchFromRemote(id));
                         body = "{\"ok\":true}";
                     }
                     else body = RemotePanelHtml();
@@ -1497,7 +1497,7 @@ public partial class MainWindow : Window
             Width = 512, Height = 512, Stretch = System.Windows.Media.Stretch.Fill,
             Source = bmp, Cursor = System.Windows.Input.Cursors.Pen
         };
-        System.Windows.Media.RenderOptions.SetBitmapScalingMode(image, System.Windows.Media.Imaging.BitmapScalingMode.NearestNeighbor);
+        System.Windows.Media.RenderOptions.SetBitmapScalingMode(image, System.Windows.Media.BitmapScalingMode.NearestNeighbor);
 
         Color current = Colors.White;
 
@@ -1861,7 +1861,7 @@ public partial class MainWindow : Window
             int current = Interlocked.Increment(ref done);
             if (current % 50 == 0 || current == entries.Count)
             {
-                Dispatcher.BeginInvoke(() => Progress.Value = 60 + 39.0 * current / Math.Max(1, entries.Count));
+                _ = Dispatcher.BeginInvoke(() => Progress.Value = 60 + 39.0 * current / Math.Max(1, entries.Count));
                 Log($"资源并发下载进度：{current}/{entries.Count}");
             }
         });
