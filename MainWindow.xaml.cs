@@ -9,6 +9,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media;
 
 namespace MC_Launcher_Revival;
 
@@ -1011,6 +1012,297 @@ public partial class MainWindow : Window
     }
 
     /// <summary>读取最近的崩溃报告/日志，给出中文结论，而不是让玩家自己看堆栈。</summary>
+    /// <summary>资源包 / 光影包管理：列出目录，双击切换启用，支持导入与删除。</summary>
+    private void ResourcePacks_Click(object sender, RoutedEventArgs e)
+    {
+        string baseDir = GameDirForVersion(SelectedVersionId());
+        var win = new Window
+        {
+            Title = "X · 资源包与光影", Width = 760, Height = 560, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = Brushes.White
+        };
+        var tabs = new TabControl { Margin = new Thickness(16) };
+        tabs.Items.Add(BuildPackTab(win, Path.Combine(baseDir, "resourcepacks"), "资源包", new[] { ".zip" }));
+        tabs.Items.Add(BuildPackTab(win, Path.Combine(baseDir, "shaderpacks"), "光影包", new[] { ".zip" }));
+        win.Content = tabs;
+        win.ShowDialog();
+    }
+
+    private TabItem BuildPackTab(Window owner, string dir, string title, string[] extensions)
+    {
+        var list = new ListBox { Height = 380, Margin = new Thickness(0, 10, 0, 10) };
+        var status = new TextBlock { Foreground = Brushes.Gray, Margin = new Thickness(2, 0, 0, 0) };
+        var panel = new DockPanel { Margin = new Thickness(14) };
+        var buttons = new WrapPanel { Margin = new Thickness(0, 0, 0, 8) };
+
+        void Refresh()
+        {
+            Directory.CreateDirectory(dir);
+            list.Items.Clear();
+            foreach (var f in Directory.GetFiles(dir).Where(f => extensions.Any(ext => f.EndsWith(ext, StringComparison.OrdinalIgnoreCase) || f.EndsWith(ext + ".disabled", StringComparison.OrdinalIgnoreCase))).OrderBy(f => Path.GetFileName(f)))
+                list.Items.Add(Path.GetFileName(f));
+            status.Text = $"{list.Items.Count} 个 · {dir}";
+        }
+
+        var toggle = new Button { Content = "启用 / 停用", Margin = new Thickness(0, 0, 8, 0) };
+        toggle.Click += (_, __) =>
+        {
+            if (list.SelectedItem is not string name) return;
+            string path = Path.Combine(dir, name);
+            try
+            {
+                if (name.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase))
+                    File.Move(path, Path.Combine(dir, name[..^9]), true);
+                else
+                    File.Move(path, path + ".disabled", true);
+                Refresh();
+            }
+            catch (Exception ex) { MessageBox.Show(owner, "操作失败：" + ex.Message); }
+        };
+
+        var import = new Button { Content = "导入", Margin = new Thickness(0, 0, 8, 0) };
+        import.Click += (_, __) =>
+        {
+            var dlg = new OpenFileDialog { Filter = "压缩包 (*.zip)|*.zip", Multiselect = true };
+            if (dlg.ShowDialog() != true) return;
+            Directory.CreateDirectory(dir);
+            foreach (var f in dlg.FileNames) { try { File.Copy(f, Path.Combine(dir, Path.GetFileName(f)), true); } catch { } }
+            Refresh();
+        };
+
+        var remove = new Button { Content = "删除", Margin = new Thickness(0, 0, 8, 0) };
+        remove.Click += (_, __) =>
+        {
+            if (list.SelectedItem is not string name) return;
+            if (MessageBox.Show(owner, $"确定删除 {name} 吗？", "确认删除", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+            try { File.Delete(Path.Combine(dir, name)); Refresh(); } catch (Exception ex) { MessageBox.Show(owner, "删除失败：" + ex.Message); }
+        };
+
+        var open = new Button { Content = "打开文件夹" };
+        open.Click += (_, __) => { try { Directory.CreateDirectory(dir); Process.Start(new ProcessStartInfo(dir) { UseShellExecute = true }); } catch { } };
+
+        foreach (var b in new[] { toggle, import, remove, open }) buttons.Children.Add(b);
+        DockPanel.SetDock(buttons, Dock.Top); panel.Children.Add(buttons);
+        DockPanel.SetDock(status, Dock.Bottom); panel.Children.Add(status);
+        panel.Children.Add(list);
+        Refresh();
+        return new TabItem { Header = title, Content = panel };
+    }
+
+    /// <summary>服务器收藏：存 servers.json，可复制地址、启动游戏后手动粘贴。</summary>
+    private void Servers_Click(object sender, RoutedEventArgs e)
+    {
+        string file = Path.Combine(_gameDir, "xlauncher-servers.json");
+        List<ServerEntry> entries = new();
+        try
+        {
+            if (File.Exists(file)) entries = JsonSerializer.Deserialize<List<ServerEntry>>(File.ReadAllText(file)) ?? new();
+        }
+        catch { }
+
+        var win = new Window
+        {
+            Title = "X · 服务器收藏", Width = 620, Height = 480, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = Brushes.White
+        };
+        var list = new ListBox { Height = 300, DisplayMemberPath = "Display", Margin = new Thickness(0, 10, 0, 10) };
+        var nameBox = new TextBox { Width = 150, Margin = new Thickness(0, 0, 8, 0) };
+        var addrBox = new TextBox { Width = 260, Margin = new Thickness(0, 0, 8, 0) };
+        var status = new TextBlock { Foreground = Brushes.Gray };
+
+        void Save()
+        {
+            try { File.WriteAllText(file, JsonSerializer.Serialize(entries, new JsonSerializerOptions { WriteIndented = true })); } catch { }
+        }
+        void Refresh()
+        {
+            list.ItemsSource = null;
+            list.ItemsSource = entries.ToList();
+            status.Text = $"{entries.Count} 个服务器 · {file}";
+        }
+
+        var add = new Button { Content = "添加" };
+        add.Click += (_, __) =>
+        {
+            string addr = addrBox.Text.Trim();
+            if (string.IsNullOrWhiteSpace(addr)) { MessageBox.Show(win, "地址不能为空。"); return; }
+            entries.Add(new ServerEntry { Name = string.IsNullOrWhiteSpace(nameBox.Text) ? addr : nameBox.Text.Trim(), Address = addr });
+            Save(); Refresh(); nameBox.Clear(); addrBox.Clear();
+        };
+        var del = new Button { Content = "删除", Margin = new Thickness(8, 0, 0, 0) };
+        del.Click += (_, __) =>
+        {
+            if (list.SelectedItem is not ServerEntry se) return;
+            entries.RemoveAll(x => x.Address == se.Address && x.Name == se.Name);
+            Save(); Refresh();
+        };
+        var copy = new Button { Content = "复制地址", Margin = new Thickness(8, 0, 0, 0) };
+        copy.Click += (_, __) =>
+        {
+            if (list.SelectedItem is not ServerEntry se) return;
+            try { System.Windows.Clipboard.SetText(se.Address); status.Text = "已复制：" + se.Address; } catch { }
+        };
+
+        var form = new WrapPanel();
+        form.Children.Add(nameBox); form.Children.Add(addrBox); form.Children.Add(add); form.Children.Add(del); form.Children.Add(copy);
+        var root = new StackPanel { Margin = new Thickness(18) };
+        root.Children.Add(new TextBlock { Text = "服务器收藏", FontSize = 22, FontWeight = FontWeights.SemiBold });
+        root.Children.Add(new TextBlock { Text = "这里只做收藏与复制；进游戏后在「多人游戏」里粘贴地址。", Foreground = Brushes.Gray, Margin = new Thickness(0, 6, 0, 0) });
+        root.Children.Add(form); root.Children.Add(list); root.Children.Add(status);
+        win.Content = root;
+        Refresh();
+        win.ShowDialog();
+    }
+
+    private sealed class ServerEntry
+    {
+        public string Name { get; set; } = "";
+        public string Address { get; set; } = "";
+        [System.Text.Json.Serialization.JsonIgnore]
+        public string Display => $"{Name}  —  {Address}";
+    }
+
+    /// <summary>检查 GitHub 上有没有比当前更新的 release。</summary>
+    private async void CheckUpdate_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            SetStatus("正在检查更新……");
+            using var req = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/repos/ppgg6/MC-Launcher-Revival/releases/latest");
+            req.Headers.UserAgent.ParseAdd("XLauncher/4.5");
+            using var resp = await Http.SendAsync(req);
+            resp.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            string tag = doc.RootElement.TryGetProperty("tag_name", out var t) ? t.GetString() ?? "" : "";
+            string url = doc.RootElement.TryGetProperty("html_url", out var h) ? h.GetString() ?? "" : "";
+            string current = typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0";
+            SetStatus($"最新版本：{tag}（当前 {current}）");
+            var result = MessageBox.Show($"最新发布：{tag}\n当前版本：{current}\n\n要打开下载页面吗？", "检查更新", MessageBoxButton.YesNo, MessageBoxImage.Information);
+            if (result == MessageBoxResult.Yes && !string.IsNullOrWhiteSpace(url))
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            SetStatus("检查更新失败：" + ex.Message);
+            Log("检查更新失败：" + ex);
+        }
+    }
+
+    private void SkinEditor_Click(object sender, RoutedEventArgs e)
+    {
+        var win = new Window
+        {
+            Title = "X · 皮肤编辑器（64×64）", Width = 620, Height = 720, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = System.Windows.Media.Brushes.White
+        };
+
+        var bmp = new System.Windows.Media.Imaging.WriteableBitmap(64, 64, 96, 96,
+            System.Windows.Media.PixelFormats.Bgra32, null);
+        var pixels = new byte[64 * 64 * 4];
+        void Flush() => bmp.WritePixels(new Int32Rect(0, 0, 64, 64), pixels, 64 * 4, 0);
+        Flush();
+
+        var image = new Image
+        {
+            Width = 512, Height = 512, Stretch = System.Windows.Media.Stretch.Fill,
+            Source = bmp, Cursor = System.Windows.Input.Cursors.Pen
+        };
+        System.Windows.Media.RenderOptions.SetBitmapScalingMode(image, System.Windows.Media.Imaging.BitmapScalingMode.NearestNeighbor);
+
+        Color current = Colors.White;
+
+        void Paint(Point pos, bool erase)
+        {
+            int x = (int)(pos.X / image.ActualWidth * 64), y = (int)(pos.Y / image.ActualHeight * 64);
+            if (x < 0 || y < 0 || x >= 64 || y >= 64) return;
+            int i = (y * 64 + x) * 4;
+            if (erase) { pixels[i] = 0; pixels[i + 1] = 0; pixels[i + 2] = 0; pixels[i + 3] = 0; }
+            else { pixels[i] = current.B; pixels[i + 1] = current.G; pixels[i + 2] = current.R; pixels[i + 3] = 255; }
+            Flush();
+        }
+
+        image.MouseDown += (_, ev) => { if (ev.LeftButton == System.Windows.Input.MouseButtonState.Pressed) Paint(ev.GetPosition(image), false); };
+        image.MouseMove += (_, ev) => { if (ev.LeftButton == System.Windows.Input.MouseButtonState.Pressed) Paint(ev.GetPosition(image), false); };
+        image.MouseRightButtonDown += (_, ev) => Paint(ev.GetPosition(image), true);
+        image.MouseMove += (_, ev) => { if (ev.RightButton == System.Windows.Input.MouseButtonState.Pressed) Paint(ev.GetPosition(image), true); };
+
+        var palette = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
+        Color[] colors = {
+            Colors.White, Colors.Black, Color.FromRgb(0xE8,0xB4,0x9A), Color.FromRgb(0xC6,0x8B,0x6B),
+            Color.FromRgb(0xFF,0x3B,0x3B), Color.FromRgb(0xFF,0x9A,0x3D), Color.FromRgb(0xFF,0xE0,0x5A), Color.FromRgb(0x6B,0xD3,0x4E),
+            Color.FromRgb(0x2F,0xA8,0x8C), Color.FromRgb(0x4A,0x9B,0xFF), Color.FromRgb(0x33,0x45,0x99), Color.FromRgb(0x8F,0x5A,0xD6),
+            Color.FromRgb(0xE0,0x4F,0xB8), Color.FromRgb(0x7A,0x4E,0x32), Color.FromRgb(0x9C,0x9C,0x9C), Color.FromRgb(0x3A,0x3A,0x3A)
+        };
+        foreach (var c in colors)
+        {
+            var sw = new Border { Width = 30, Height = 30, Margin = new Thickness(4), CornerRadius = new CornerRadius(5),
+                Background = new SolidColorBrush(c), BorderBrush = Brushes.LightGray, BorderThickness = new Thickness(1), Cursor = System.Windows.Input.Cursors.Hand };
+            var capture = c;
+            sw.MouseLeftButtonDown += (_, __) => { current = capture; };
+            palette.Children.Add(sw);
+        }
+
+        var import = new Button { Content = "导入皮肤 PNG" };
+        import.Click += (_, __) =>
+        {
+            var dlg = new OpenFileDialog { Filter = "皮肤图片 (*.png)|*.png" };
+            if (dlg.ShowDialog() != true) return;
+            try
+            {
+                var src = new System.Windows.Media.Imaging.BitmapImage(new Uri(dlg.FileName));
+                var converted = new System.Windows.Media.Imaging.FormatConvertedBitmap(src, System.Windows.Media.PixelFormats.Bgra32, null, 0);
+                int w = converted.PixelWidth, h = converted.PixelHeight;
+                var tmp = new byte[w * h * 4];
+                converted.CopyPixels(tmp, w * 4, 0);
+                Array.Clear(pixels, 0, pixels.Length);
+                for (int y = 0; y < Math.Min(64, h); y++)
+                    for (int x = 0; x < Math.Min(64, w); x++)
+                    {
+                        int si = (y * w + x) * 4, di = (y * 64 + x) * 4;
+                        pixels[di] = tmp[si]; pixels[di + 1] = tmp[si + 1]; pixels[di + 2] = tmp[si + 2]; pixels[di + 3] = tmp[si + 3];
+                    }
+                Flush();
+            }
+            catch (Exception ex) { MessageBox.Show(win, "导入失败：" + ex.Message); }
+        };
+
+        var save = new Button { Content = "保存为 PNG" };
+        save.Click += (_, __) =>
+        {
+            var dlg = new SaveFileDialog { Filter = "PNG 图片 (*.png)|*.png", FileName = "skin.png" };
+            if (dlg.ShowDialog() != true) return;
+            try
+            {
+                var encoder = new System.Windows.Media.Imaging.PngBitmapEncoder();
+                encoder.Frames.Add(System.Windows.Media.Imaging.BitmapFrame.Create(bmp));
+                using var fs = File.Create(dlg.FileName);
+                encoder.Save(fs);
+                Log("皮肤已保存：" + dlg.FileName);
+                MessageBox.Show(win, "已保存：" + dlg.FileName);
+            }
+            catch (Exception ex) { MessageBox.Show(win, "保存失败：" + ex.Message); }
+        };
+
+        var clear = new Button { Content = "清空" };
+        clear.Click += (_, __) => { Array.Clear(pixels, 0, pixels.Length); Flush(); };
+
+        var tools = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
+        tools.Children.Add(import); tools.Children.Add(save); tools.Children.Add(clear);
+
+        var root = new StackPanel { Margin = new Thickness(18) };
+        root.Children.Add(new TextBlock { Text = "皮肤编辑器", FontSize = 22, FontWeight = FontWeights.SemiBold });
+        root.Children.Add(new TextBlock
+        {
+            Text = "左键涂色、右键擦除。原版皮肤是 64×64（旧版 64×32 会自动补齐）。",
+            Foreground = System.Windows.Media.Brushes.Gray, Margin = new Thickness(0, 6, 0, 12)
+        });
+        root.Children.Add(image);
+        root.Children.Add(palette);
+        root.Children.Add(tools);
+        win.Content = new ScrollViewer { Content = root };
+        win.ShowDialog();
+    }
+
     private void CrashAnalyze_Click(object sender, RoutedEventArgs e)
     {
         string id = SelectedVersionId();

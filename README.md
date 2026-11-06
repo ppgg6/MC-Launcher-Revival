@@ -1,4 +1,4 @@
-# X Launcher v4.5.0-preview2 开发版
+# X Launcher v4.5.0-preview4 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -179,3 +179,19 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
 - **整合包导入**：选一个 `.mrpack`，读 `modrinth.index.json`，把 `files` 里的资源逐个下载到当前版本的游戏目录，再解压 `overrides/` 覆盖配置；带路径穿越防护，包版本与所选版本不一致时会先警告。
 - **单文件断点续传**：下载中断后保留 `.part`，下次用 HTTP Range 续传，不再整包重下；只有校验失败才丢弃临时文件。
+
+
+
+## v4.5.0-preview3（4.5 第三批）
+
+- **皮肤编辑器**：侧栏新增入口，打开一个 64×64 画布，左键涂色、右键擦除，16 色调色板，可导入已有 PNG（自动补齐 64×32 旧皮肤）并导出 PNG。
+- 说明：目前是平面像素编辑，没有 3D 人物预览；皮肤保存后需要自己上传到 Minecraft 官网或对应服务器。
+
+
+
+## v4.5.0-preview4（4.5 第四批）
+
+- **资源包与光影管理**：侧栏入口，两个标签页分别管理 `resourcepacks/` 与 `shaderpacks/`；双击/按钮切换启用（改 `.disabled` 后缀）、导入 zip、删除、打开文件夹。
+- **服务器收藏**：侧栏入口，地址存在 `xlauncher-servers.json`，支持添加/删除/复制地址（进游戏后粘贴到「多人游戏」）。
+- **检查更新**：读 GitHub 最新 release 的 tag 与当前版本对比，可直接打开下载页。
+- **界面**：卡片加柔和投影，侧栏补齐新入口。
