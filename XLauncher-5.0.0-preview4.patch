@@ -1,0 +1,74 @@
+diff --git a/MC_Launcher_Revival.csproj b/MC_Launcher_Revival.csproj
+index 89e2e0e..37d2217 100644
+--- a/MC_Launcher_Revival.csproj
++++ b/MC_Launcher_Revival.csproj
+@@ -6,7 +6,7 @@
+     <Nullable>enable</Nullable>
+     <ImplicitUsings>enable</ImplicitUsings>
+     <AssemblyName>XLauncher</AssemblyName>
+-    <Version>5.0.0-preview3</Version>
++    <Version>5.0.0-preview4</Version>
+     <AssemblyVersion>4.0.0.0</AssemblyVersion>
+     <FileVersion>4.0.0.0</FileVersion>
+     <RootNamespace>MC_Launcher_Revival</RootNamespace>
+diff --git a/MainWindow.xaml.cs b/MainWindow.xaml.cs
+index ac59e76..209dd4e 100644
+--- a/MainWindow.xaml.cs
++++ b/MainWindow.xaml.cs
+@@ -1086,7 +1086,7 @@ public partial class MainWindow : Window
+                 await DownloadAndVerifyAsync(urls[0], dest, sha1, size);
+                 done++;
+                 SetStatus($"整合包 {packName}：{done}/{files.Count} 个文件");
+-                Dispatcher.BeginInvoke(() => Progress.Value = files.Count == 0 ? 90 : 90.0 * done / files.Count);
++                _ = Dispatcher.BeginInvoke(() => Progress.Value = files.Count == 0 ? 90 : 90.0 * done / files.Count);
+             }
+ 
+             string overrides = Path.Combine(temp, "overrides");
+@@ -1379,7 +1379,7 @@ public partial class MainWindow : Window
+                     {
+                         contentType = "application/json; charset=utf-8";
+                         string id = path.Contains("id=") ? Uri.UnescapeDataString(path[(path.IndexOf("id=") + 3)..]) : "";
+-                        Dispatcher.BeginInvoke(() => LaunchFromRemote(id));
++                        _ = Dispatcher.BeginInvoke(() => LaunchFromRemote(id));
+                         body = "{\"ok\":true}";
+                     }
+                     else body = RemotePanelHtml();
+@@ -1497,7 +1497,7 @@ public partial class MainWindow : Window
+             Width = 512, Height = 512, Stretch = System.Windows.Media.Stretch.Fill,
+             Source = bmp, Cursor = System.Windows.Input.Cursors.Pen
+         };
+-        System.Windows.Media.RenderOptions.SetBitmapScalingMode(image, System.Windows.Media.Imaging.BitmapScalingMode.NearestNeighbor);
++        System.Windows.Media.RenderOptions.SetBitmapScalingMode(image, System.Windows.Media.BitmapScalingMode.NearestNeighbor);
+ 
+         Color current = Colors.White;
+ 
+@@ -1861,7 +1861,7 @@ public partial class MainWindow : Window
+             int current = Interlocked.Increment(ref done);
+             if (current % 50 == 0 || current == entries.Count)
+             {
+-                Dispatcher.BeginInvoke(() => Progress.Value = 60 + 39.0 * current / Math.Max(1, entries.Count));
++                _ = Dispatcher.BeginInvoke(() => Progress.Value = 60 + 39.0 * current / Math.Max(1, entries.Count));
+                 Log($"资源并发下载进度：{current}/{entries.Count}");
+             }
+         });
+diff --git a/README.md b/README.md
+index d2e3c35..3fcd776 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,4 @@
+-# X Launcher v5.0.0-preview3 开发版
++# X Launcher v5.0.0-preview4 开发版
+ 
+ Windows WPF / .NET 8 Minecraft Java Edition launcher.
+ 
+@@ -228,3 +228,10 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
+ - **实例设置**：每个版本可以单独指定内存、专用 Java、备注（存进 settings.json 的 `instances`），启动时实例设置优先于全局。
+ - **自动更新**：检查更新时如果 release 里带 `.exe` 资产，会下载后用批处理替换当前程序并重启（没有资产则回落到打开下载页）。
+ - **写入服务器列表**：服务器收藏窗口新增「同步到游戏」，把收藏写成 `servers.dat`（NBT + gzip，写入前自动备份原文件），进游戏就能在多人列表里看到。
++
++
++
++## v5.0.0-preview4：修复编译错误
++
++- 皮肤编辑器里 `BitmapScalingMode` 的命名空间写错了（`System.Windows.Media.Imaging` → 应为 `System.Windows.Media`），导致 CI 编译失败。
++- 三处 `Dispatcher.BeginInvoke` 未等待产生 CS4014 警告，改成显式丢弃（`_ =`）。
