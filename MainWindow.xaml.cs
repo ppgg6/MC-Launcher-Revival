@@ -1595,6 +1595,51 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>画一个基础人物：按标准 64×64 皮肤 UV 分区铺色（头/身/四肢 + 简单五官）。</summary>
+    private static void PaintBaseSkin(byte[] px)
+    {
+        void Rect(int x0, int y0, int w, int h, byte r, byte g, byte b)
+        {
+            for (int y = y0; y < y0 + h && y < 64; y++)
+                for (int x = x0; x < x0 + w && x < 64; x++)
+                {
+                    int i = (y * 64 + x) * 4;
+                    px[i] = b; px[i + 1] = g; px[i + 2] = r; px[i + 3] = 255;
+                }
+        }
+
+        byte skinR = 240, skinG = 200, skinB = 160;   // 肤色
+        byte hairR = 58, hairG = 91, hairB = 160;     // 蓝发（对应鲸鱼娘）
+        byte shirtR = 46, shirtG = 74, shirtB = 125;  // 深蓝上衣
+        byte apronR = 255, apronG = 255, apronB = 255;
+        byte pantsR = 31, pantsG = 51, pantsB = 88;
+        byte shoeR = 43, shoeG = 43, shoeB = 43;
+
+        // 头：六个面都铺肤色，顶面和后脑加头发
+        Rect(0, 0, 32, 16, skinR, skinG, skinB);
+        Rect(8, 0, 16, 8, hairR, hairG, hairB);    // 头顶
+        Rect(24, 8, 8, 8, hairR, hairG, hairB);    // 后脑
+        Rect(8, 8, 8, 2, hairR, hairG, hairB);     // 刘海
+        Rect(10, 12, 2, 2, 40, 40, 40);            // 左眼
+        Rect(14, 12, 2, 2, 40, 40, 40);            // 右眼
+
+        // 身体：上衣 + 围裙
+        Rect(16, 16, 24, 16, shirtR, shirtG, shirtB);
+        Rect(20, 24, 8, 8, apronR, apronG, apronB);
+
+        // 右臂 / 左臂：肤色 + 短袖
+        Rect(40, 16, 16, 16, skinR, skinG, skinB);
+        Rect(44, 16, 4, 6, shirtR, shirtG, shirtB);
+        Rect(32, 48, 16, 16, skinR, skinG, skinB);
+        Rect(36, 48, 4, 6, shirtR, shirtG, shirtB);
+
+        // 右腿 / 左腿：裤子 + 鞋
+        Rect(0, 16, 16, 16, pantsR, pantsG, pantsB);
+        Rect(4, 28, 4, 4, shoeR, shoeG, shoeB);
+        Rect(16, 48, 16, 16, pantsR, pantsG, pantsB);
+        Rect(20, 60, 4, 4, shoeR, shoeG, shoeB);
+    }
+
     private void SkinEditor_Click(object sender, RoutedEventArgs e)
     {
         var win = new Window
@@ -1690,17 +1735,24 @@ public partial class MainWindow : Window
             catch (Exception ex) { MessageBox.Show(win, "保存失败：" + ex.Message); }
         };
 
+        // 打开时先给一个基础人物（按 64×64 标准 UV 分区铺色），再让人物往上画。
+        PaintBaseSkin(pixels);
+        Flush();
+
+        var reset = new Button { Content = "重置为默认人物", Margin = new Thickness(0, 0, 8, 0) };
+        reset.Click += (_, __) => { Array.Clear(pixels, 0, pixels.Length); PaintBaseSkin(pixels); Flush(); };
+
         var clear = new Button { Content = "清空" };
         clear.Click += (_, __) => { Array.Clear(pixels, 0, pixels.Length); Flush(); };
 
         var tools = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
-        tools.Children.Add(import); tools.Children.Add(save); tools.Children.Add(clear);
+        tools.Children.Add(import); tools.Children.Add(save); tools.Children.Add(reset); tools.Children.Add(clear);
 
         var root = new StackPanel { Margin = new Thickness(18) };
         root.Children.Add(new TextBlock { Text = "皮肤编辑器", FontSize = 22, FontWeight = FontWeights.SemiBold });
         root.Children.Add(new TextBlock
         {
-            Text = "左键涂色、右键擦除。原版皮肤是 64×64（旧版 64×32 会自动补齐）。",
+            Text = "已经给你放好一个基础人物：左键涂色、右键擦除，先改头发/衣服颜色也可以。",
             Foreground = System.Windows.Media.Brushes.Gray, Margin = new Thickness(0, 6, 0, 12)
         });
         root.Children.Add(image);
