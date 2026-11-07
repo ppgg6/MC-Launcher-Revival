@@ -1,4 +1,4 @@
-# X Launcher v5.0.0-preview3 开发版
+# X Launcher v5.0.0-preview6 开发版
 
 Windows WPF / .NET 8 Minecraft Java Edition launcher.
 
@@ -228,3 +228,25 @@ Windows WPF / .NET 8 Minecraft Java Edition launcher.
 - **实例设置**：每个版本可以单独指定内存、专用 Java、备注（存进 settings.json 的 `instances`），启动时实例设置优先于全局。
 - **自动更新**：检查更新时如果 release 里带 `.exe` 资产，会下载后用批处理替换当前程序并重启（没有资产则回落到打开下载页）。
 - **写入服务器列表**：服务器收藏窗口新增「同步到游戏」，把收藏写成 `servers.dat`（NBT + gzip，写入前自动备份原文件），进游戏就能在多人列表里看到。
+
+
+
+## v5.0.0-preview4：修复编译错误
+
+- 皮肤编辑器里 `BitmapScalingMode` 的命名空间写错了（`System.Windows.Media.Imaging` → 应为 `System.Windows.Media`），导致 CI 编译失败。
+- 三处 `Dispatcher.BeginInvoke` 未等待产生 CS4014 警告，改成显式丢弃（`_ =`）。
+
+
+
+## v5.0.0-preview5：Java 改用国内镜像
+
+- Adoptium 官方接口会 302 到 GitHub，国内经常超时（报 `github.com:443` 连不上）。
+- 现在优先从**清华 TUNA 的 Adoptium 镜像**取 Windows x64 的 JRE/JDK zip（`mirrors.tuna.tsinghua.edu.cn/Adoptium/<主版本>/<jre|jdk>/x64/windows/`），失败才回退 Adoptium 官方接口。
+- 日志里会写明这次用的是镜像还是官方源。
+
+
+
+## v5.0.0-preview6：下载进度窗口与并发优化
+
+- **下载进度窗口**：开始装游戏时自动弹出，显示百分比、已完成/总数、还剩多少个文件、已下载大小、用时与平均速度，以及当前正在下载的文件名；完成后 3 秒自动关闭。
+- **小文件高并发**：资源/模组这类小于 2 MB 的文件走独立通道（并发 = CPU 核数，6~16 路），大文件仍按核数÷2，避免几百个小文件被几个大文件堵住。

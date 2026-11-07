@@ -28,6 +28,8 @@ public partial class MainWindow : Window
     // 按 CPU 核数自适应：老机器少开一点，避免下载 + SHA-1 把机器压死；新机器最多 8 路。
     private static readonly int MaxParallel = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
     private static readonly SemaphoreSlim DownloadSlots = new(MaxParallel, MaxParallel);
+    // 资源包/模组这类小文件多、单个体积小，单独给更高的并发，避免被大文件堵住。
+    private static readonly SemaphoreSlim AssetSlots = new(Math.Clamp(Environment.ProcessorCount, 6, 16), Math.Clamp(Environment.ProcessorCount, 6, 16));
     private static readonly long TotalRamBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
     private List<VersionRow> _versions = new();
     private static readonly int[] MemoryOptions = { 1024, 2048, 4096, 6144, 8192, 12288, 16384 };
@@ -176,6 +178,27 @@ public partial class MainWindow : Window
         catch (Exception ex) { SetStatus("Java 自动安装失败：" + ex.Message); Log("Java 安装错误：" + ex); MessageBox.Show(ex.Message, "Java 安装失败"); }
     }
 
+    /// <summary>在清华 Adoptium 镜像里找对应主版本的 Windows x64 zip；找不到返回 null。</summary>
+    private static async Task<string?> FindTunaJavaUrlAsync(int major)
+    {
+        foreach (string kind in new[] { "jre", "jdk" })
+        {
+            try
+            {
+                string dir = $"https://mirrors.tuna.tsinghua.edu.cn/Adoptium/{major}/{kind}/x64/windows/";
+                using var resp = await Http.GetAsync(dir);
+                if (!resp.IsSuccessStatusCode) continue;
+                string html = await resp.Content.ReadAsStringAsync();
+                var matches = System.Text.RegularExpressions.Regex.Matches(html, @"href=""([^""]+\.zip)""");
+                if (matches.Count == 0) continue;
+                string file = matches[matches.Count - 1].Groups[1].Value;
+                return dir + file;
+            }
+            catch { }
+        }
+        return null;
+    }
+
     /// <summary>探测 Adoptium 是否提供该包；网络异常时返回 true，交给正式下载流程去重试和报错。</summary>
     private async Task<bool> AdoptiumHasPackageAsync(string url)
     {
@@ -225,12 +248,21 @@ public partial class MainWindow : Window
         if (existing != null && IsJavaCompatible(existing, major)) { _javaPath = existing; return existing; }
         SetStatus($"正在查询 Adoptium 官方 Java {major} 下载包……");
         Log($"开始下载 Eclipse Temurin Java {major}。安装目录：{installDir}");
-        // 部分主版本（例如 25）Adoptium 可能只提供 JDK 而没有 JRE，先探测再决定用哪个包。
-        string api = $"https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jre/hotspot/normal/eclipse";
-        if (!await AdoptiumHasPackageAsync(api))
+        // 国内网络直连 Adoptium 会 302 到 GitHub，经常超时；优先用清华镜像，失败再回退官方。
+        string? api = await FindTunaJavaUrlAsync(major);
+        if (api != null)
         {
-            api = $"https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jdk/hotspot/normal/eclipse";
-            Log($"Adoptium 没有 Java {major} 的 JRE 包，改用 JDK 包。");
+            Log($"Java {major} 使用清华镜像下载：{api}");
+        }
+        else
+        {
+            api = $"https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jre/hotspot/normal/eclipse";
+            if (!await AdoptiumHasPackageAsync(api))
+            {
+                api = $"https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jdk/hotspot/normal/eclipse";
+                Log($"Adoptium 没有 Java {major} 的 JRE 包，改用 JDK 包。");
+            }
+            Log($"清华镜像不可用，回退 Adoptium 官方源：{api}");
         }
         string archive = Path.Combine(javaRoot, $"temurin-{major}.zip");
         await DownloadJavaArchiveAsync(api, archive, major);
@@ -715,6 +747,7 @@ public partial class MainWindow : Window
             Progress.Value = 0;
             SetStatus($"正在准备安装 {selected.Id}……");
             Log($"开始安装 Vanilla {selected.Id}");
+            BeginDownloadSession($"安装 Minecraft {selected.Id}");
             var metaBytes = await Http.GetByteArrayAsync(selected.Url);
             using var metaDoc = JsonDocument.Parse(metaBytes);
             var meta = metaDoc.RootElement;
@@ -734,6 +767,7 @@ public partial class MainWindow : Window
             if (AutoJavaCheck.IsChecked == true) await EnsureJavaForVersionAsync(meta, selected.Id);
             Progress.Value = 100;
             SetStatus($"版本 {selected.Id} 安装完成。选择正版登录或离线本地账户后即可尝试启动。");
+            EndDownloadSession($"安装完成：{selected.Id}");
             Log($"安装流程完成：{selected.Id}。已处理依赖、原生库和 logging 配置。");
             UpdateLaunchAvailability();
         }
@@ -741,6 +775,7 @@ public partial class MainWindow : Window
         {
             SetStatus("安装失败：" + ex.Message);
             Log("安装失败：" + ex);
+            EndDownloadSession("安装失败：" + ex.Message, ok: false);
         }
     }
 
@@ -1313,10 +1348,92 @@ public partial class MainWindow : Window
     }
 
     /// <summary>检查 GitHub 上有没有比当前更新的 release。</summary>
+    /// <summary>开始一次下载会话：重置统计并弹出进度窗口。</summary>
+    private void BeginDownloadSession(string stage)
+    {
+        _dlTotalFiles = 0; _dlDoneFiles = 0; _dlBytes = 0; _dlTotalBytes = 0;
+        _dlStarted = DateTime.Now; _dlStage = stage;
+        ShowDownloadWindow();
+    }
+
+    private void ShowDownloadWindow()
+    {
+        if (_dlWindow is { IsVisible: true }) return;
+        _dlWindow = new Window
+        {
+            Title = "下载进度", Width = 540, Height = 300, Owner = this,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Background = Brushes.White, ResizeMode = ResizeMode.NoResize
+        };
+        var panel = new StackPanel { Margin = new Thickness(24) };
+        _dlStageText = new TextBlock { Text = _dlStage, FontSize = 16, FontWeight = FontWeights.SemiBold };
+        _dlBar = new ProgressBar { Height = 14, Minimum = 0, Maximum = 100, Margin = new Thickness(0, 14, 0, 12) };
+        _dlPct = new TextBlock { FontSize = 22, FontWeight = FontWeights.SemiBold };
+        _dlCount = new TextBlock { Margin = new Thickness(0, 6, 0, 0), Foreground = Brushes.DimGray };
+        _dlSpeed = new TextBlock { Margin = new Thickness(0, 4, 0, 0), Foreground = Brushes.DimGray };
+        panel.Children.Add(_dlStageText);
+        panel.Children.Add(_dlBar);
+        panel.Children.Add(_dlPct);
+        panel.Children.Add(_dlCount);
+        panel.Children.Add(_dlSpeed);
+        _dlWindow.Content = panel;
+
+        _dlTimer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background)
+        { Interval = TimeSpan.FromMilliseconds(400) };
+        _dlTimer.Tick += (_, __) => UpdateDownloadWindow();
+        _dlTimer.Start();
+        _dlWindow.Closed += (_, __) => { _dlTimer?.Stop(); _dlTimer = null; _dlWindow = null; };
+        _dlWindow.Show();
+    }
+
+    private void UpdateDownloadWindow()
+    {
+        if (_dlWindow == null) return;
+        double bytesPct = _dlTotalBytes > 0 ? Math.Min(100, _dlBytes * 100.0 / _dlTotalBytes) : 0;
+        double filePct = _dlTotalFiles > 0 ? Math.Min(100, _dlDoneFiles * 100.0 / _dlTotalFiles) : 0;
+        double pct = _dlTotalBytes > 0 ? Math.Max(bytesPct, filePct) : filePct;
+        if (_dlBar != null) _dlBar.Value = pct;
+        if (_dlPct != null) _dlPct.Text = $"{pct:F1}%";
+        if (_dlCount != null)
+            _dlCount.Text = $"已完成 {_dlDoneFiles} / {_dlTotalFiles} 个文件 · 还剩 {Math.Max(0, _dlTotalFiles - _dlDoneFiles)} 个";
+        if (_dlSpeed != null)
+        {
+            double sec = Math.Max(1, (DateTime.Now - _dlStarted).TotalSeconds);
+            _dlSpeed.Text = $"已下载 {_dlBytes / 1024d / 1024d:F1} MB · 用时 {sec:F0}s · 约 {_dlBytes / 1024d / 1024d / sec:F2} MB/s";
+        }
+        if (_dlStageText != null) _dlStageText.Text = _dlStage;
+    }
+
+    /// <summary>结束下载会话：把结果写在窗口上，3 秒后自动关闭。</summary>
+    private void EndDownloadSession(string message, bool ok = true)
+    {
+        _dlTimer?.Stop();
+        _dlStage = message;
+        UpdateDownloadWindow();
+        if (_dlBar != null) _dlBar.Value = ok ? 100 : _dlBar.Value;
+        var win = _dlWindow;
+        if (win != null)
+        {
+            var t = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+            t.Tick += (_, __) => { t.Stop(); try { win.Close(); } catch { } };
+            t.Start();
+        }
+    }
+
     private void RemotePanel_Click(object sender, RoutedEventArgs e) => StartRemotePanel();
 
     private System.Net.Sockets.TcpListener? _remoteListener;
     private readonly List<string> _recentLogs = new();
+
+    // 下载进度统计（给进度窗口用）
+    private int _dlTotalFiles, _dlDoneFiles;
+    private long _dlBytes, _dlTotalBytes;
+    private DateTime _dlStarted = DateTime.Now;
+    private string _dlStage = "";
+    private Window? _dlWindow;
+    private ProgressBar? _dlBar;
+    private TextBlock? _dlPct, _dlCount, _dlSpeed, _dlStageText;
+    private System.Windows.Threading.DispatcherTimer? _dlTimer;
 
     /// <summary>手机遥控面板：电脑上开一个小网页，手机浏览器能看状态、启动游戏、看日志。</summary>
     private void StartRemotePanel()
@@ -1879,10 +1996,15 @@ public partial class MainWindow : Window
             if (!expectedSize.HasValue || fi.Length == expectedSize.Value) return;
             File.Delete(path);
         }
-        await DownloadSlots.WaitAsync();
+        bool smallFile = expectedSize.HasValue && expectedSize.Value < 2 * 1024 * 1024;
+        var gate = smallFile ? AssetSlots : DownloadSlots;
+        await gate.WaitAsync();
         try
         {
             string temp = path + ".part";
+            _dlTotalFiles++;
+            if (expectedSize.HasValue) _dlTotalBytes += expectedSize.Value;
+            _dlStage = "正在下载：" + Path.GetFileName(path);
             Exception? last = null;
             // 多源回退：官方源失败后自动换 BMCLAPI 镜像，适合国内网络。
             foreach (string candidate in UrlCandidates(url))
@@ -1907,6 +2029,8 @@ public partial class MainWindow : Window
                         if (expectedSize.HasValue && info.Length != expectedSize.Value) throw new InvalidDataException("文件大小校验失败：" + Path.GetFileName(path));
                         if (!string.IsNullOrWhiteSpace(sha1) && await Sha1Async(temp) != sha1.ToLowerInvariant()) throw new InvalidDataException("SHA-1 校验失败：" + Path.GetFileName(path));
                         File.Move(temp, path, true);
+                        _dlDoneFiles++;
+                        _dlBytes += info.Length;
                         return;
                     }
                     catch (Exception ex)
@@ -1922,7 +2046,7 @@ public partial class MainWindow : Window
             }
             throw new IOException($"下载失败（官方源与镜像都试过了）：{Path.GetFileName(path)}", last);
         }
-        finally { DownloadSlots.Release(); }
+        finally { gate.Release(); }
     }
 
     /// <summary>给出同一个文件的候选地址：官方源在前，BMCLAPI 镜像在后。</summary>
