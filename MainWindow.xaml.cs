@@ -25,6 +25,12 @@ public partial class MainWindow : Window
         PooledConnectionLifetime = TimeSpan.FromMinutes(10),
         ConnectTimeout = TimeSpan.FromSeconds(30)
     }) { Timeout = Timeout.InfiniteTimeSpan };
+    static MainWindow()
+    {
+        // 加一个明确的 UA：部分镜像/下载站会拒绝没有 UA 的请求（GitHub 也会）。
+        Http.DefaultRequestHeaders.UserAgent.ParseAdd("XLauncher/5.0");
+        JavaHttp.DefaultRequestHeaders.UserAgent.ParseAdd("XLauncher/5.0");
+    }
     // 按 CPU 核数自适应：老机器少开一点，避免下载 + SHA-1 把机器压死；新机器最多 8 路。
     private static readonly int MaxParallel = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
     private static readonly SemaphoreSlim DownloadSlots = new(MaxParallel, MaxParallel);
@@ -292,7 +298,8 @@ public partial class MainWindow : Window
         const int maxAttempts = 5;
         const int bufferSize = 1024 * 1024; // 1 MiB 缓冲，减少小块 I/O 开销
         // 下载服务器支持 HTTP Range 时，尝试 4 路分段并发；不支持则自动回退到续传单流。
-        if (await TryDownloadJavaInParallelAsync(url, partial, major))
+        bool allowParallel = !url.Contains("mirrors.tuna", StringComparison.OrdinalIgnoreCase);
+        if (allowParallel && await TryDownloadJavaInParallelAsync(url, partial, major))
         {
             File.Move(partial, archive, true);
             Log($"Java {major} 多线程下载完成，文件大小：{new FileInfo(archive).Length / 1048576d:F1} MB。");
@@ -1391,7 +1398,9 @@ public partial class MainWindow : Window
         if (_dlWindow == null) return;
         double bytesPct = _dlTotalBytes > 0 ? Math.Min(100, _dlBytes * 100.0 / _dlTotalBytes) : 0;
         double filePct = _dlTotalFiles > 0 ? Math.Min(100, _dlDoneFiles * 100.0 / _dlTotalFiles) : 0;
+        bool finished = _dlTotalFiles > 0 && _dlDoneFiles >= _dlTotalFiles;
         double pct = _dlTotalBytes > 0 ? Math.Max(bytesPct, filePct) : filePct;
+        if (!finished && pct >= 100) pct = 99.0;
         if (_dlBar != null) _dlBar.Value = pct;
         if (_dlPct != null) _dlPct.Text = $"{pct:F1}%";
         if (_dlCount != null)
@@ -2054,13 +2063,20 @@ public partial class MainWindow : Window
         try
         {
             string temp = path + ".part";
-            _dlTotalFiles++;
-            if (expectedSize.HasValue) _dlTotalBytes += expectedSize.Value;
+            Interlocked.Increment(ref _dlTotalFiles);
+            if (expectedSize.HasValue) Interlocked.Add(ref _dlTotalBytes, expectedSize.Value);
             _dlStage = "正在下载：" + Path.GetFileName(path);
             Exception? last = null;
             // 多源回退：官方源失败后自动换 BMCLAPI 镜像，适合国内网络。
             foreach (string candidate in UrlCandidates(url))
             {
+                if (await TryParallelDownloadAsync(candidate, path, sha1, expectedSize))
+                {
+                    ScoreSource(candidate, true);
+                    Interlocked.Increment(ref _dlDoneFiles);
+                    Interlocked.Add(ref _dlBytes, expectedSize ?? 0);
+                    return;
+                }
                 for (int attempt = 1; attempt <= 3; attempt++)
                 {
                     try
@@ -2081,13 +2097,15 @@ public partial class MainWindow : Window
                         if (expectedSize.HasValue && info.Length != expectedSize.Value) throw new InvalidDataException("文件大小校验失败：" + Path.GetFileName(path));
                         if (!string.IsNullOrWhiteSpace(sha1) && await Sha1Async(temp) != sha1.ToLowerInvariant()) throw new InvalidDataException("SHA-1 校验失败：" + Path.GetFileName(path));
                         File.Move(temp, path, true);
-                        _dlDoneFiles++;
-                        _dlBytes += info.Length;
+                        ScoreSource(candidate, true);
+                        Interlocked.Increment(ref _dlDoneFiles);
+                        Interlocked.Add(ref _dlBytes, info.Length);
                         return;
                     }
                     catch (Exception ex)
                     {
                         last = ex;
+                        ScoreSource(candidate, false);
                         // 网络中断保留 .part 以便续传；校验类失败才丢弃，避免拼出坏文件。
                         if (ex is InvalidDataException) TryDeleteFile(temp);
                         if (attempt < 3) await Task.Delay(400 * attempt);
@@ -2101,19 +2119,120 @@ public partial class MainWindow : Window
         finally { gate.Release(); }
     }
 
+    /// <summary>大文件分段并发下载：先探测是否支持 Range，再切成若干段并行拉取后合并。</summary>
+    private static async Task<bool> TryParallelDownloadAsync(string url, string dest, string? sha1, long? expectedSize, int workers = 4)
+    {
+        if (!expectedSize.HasValue || expectedSize.Value < 8L * 1024 * 1024) return false;
+        if (url.Contains("mirrors.tuna", StringComparison.OrdinalIgnoreCase)) return false; // 镜像容易被并发触发防盗链
+        try
+        {
+            using var probe = new HttpRequestMessage(HttpMethod.Get, url);
+            probe.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+            using var probeResp = await Http.SendAsync(probe, HttpCompletionOption.ResponseHeadersRead);
+            if (probeResp.StatusCode != System.Net.HttpStatusCode.PartialContent) return false;
+            long total = probeResp.Content.Headers.ContentRange?.Length ?? expectedSize.Value;
+            if (total < 8L * 1024 * 1024) return false;
+
+            string temp = dest + ".part";
+            long segSize = (total + workers - 1) / workers;
+            var parts = new string[workers];
+            var jobs = new List<Task>();
+            for (int i = 0; i < workers; i++)
+            {
+                int index = i;
+                long from = index * segSize;
+                long to = Math.Min(total - 1, from + segSize - 1);
+                if (from > to) continue;
+                parts[index] = $"{temp}.seg{index}";
+                jobs.Add(Task.Run(async () =>
+                {
+                    using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                    req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(from, to);
+                    using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+                    if (resp.StatusCode != System.Net.HttpStatusCode.PartialContent) throw new IOException("服务器没有返回分段");
+                    await using var input = await resp.Content.ReadAsStreamAsync();
+                    await using var output = new FileStream(parts[index], FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, true);
+                    await input.CopyToAsync(output);
+                }));
+            }
+            await Task.WhenAll(jobs);
+
+            await using (var combined = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, true))
+                foreach (var part in parts.Where(x => x != null))
+                {
+                    await using var input = File.OpenRead(part);
+                    await input.CopyToAsync(combined);
+                }
+            foreach (var part in parts.Where(x => x != null)) TryDeleteFile(part);
+            if (new FileInfo(temp).Length != total) { TryDeleteFile(temp); return false; }
+            if (!string.IsNullOrWhiteSpace(sha1) && await Sha1Async(temp) != sha1!.ToLowerInvariant()) { TryDeleteFile(temp); return false; }
+            File.Move(temp, dest, true);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>给出同一个文件的候选地址：官方源在前，BMCLAPI 镜像在后。</summary>
+    /// <summary>下载源得分：成功 +2、失败 -3，分数高的优先试。落在 %AppData%/XLauncher/sources.json。</summary>
+    private static Dictionary<string, int> _sourceScore = new(StringComparer.OrdinalIgnoreCase);
+    private static bool _sourceScoreLoaded;
+
+    private static string SourceKey(string url)
+    {
+        try { return new Uri(url).Host; } catch { return url; }
+    }
+
+    private static void LoadSourceScore()
+    {
+        if (_sourceScoreLoaded) return;
+        _sourceScoreLoaded = true;
+        try
+        {
+            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XLauncher", "sources.json");
+            if (File.Exists(path)) _sourceScore = JsonSerializer.Deserialize<Dictionary<string, int>>(File.ReadAllText(path)) ?? new(StringComparer.OrdinalIgnoreCase);
+        }
+        catch { }
+    }
+
+    private static void SaveSourceScore()
+    {
+        try
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "XLauncher");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "sources.json"), JsonSerializer.Serialize(_sourceScore));
+        }
+        catch { }
+    }
+
+    private static void ScoreSource(string url, bool ok)
+    {
+        LoadSourceScore();
+        string key = SourceKey(url);
+        _sourceScore.TryGetValue(key, out int score);
+        _sourceScore[key] = Math.Clamp(score + (ok ? 2 : -3), -20, 20);
+        SaveSourceScore();
+    }
+
     private static IEnumerable<string> UrlCandidates(string url)
     {
-        yield return url;
+        LoadSourceScore();
+        var list = new List<string> { url };
         const string assets = "https://resources.download.minecraft.net/";
         const string libs = "https://libraries.minecraft.net/";
         const string meta = "https://piston-meta.mojang.com/";
         if (url.StartsWith(assets, StringComparison.OrdinalIgnoreCase))
-            yield return "https://bmclapi2.bangbang93.com/assets/" + url[assets.Length..];
+            list.Add("https://bmclapi2.bangbang93.com/assets/" + url[assets.Length..]);
         else if (url.StartsWith(libs, StringComparison.OrdinalIgnoreCase))
-            yield return "https://bmclapi2.bangbang93.com/maven/" + url[libs.Length..];
+            list.Add("https://bmclapi2.bangbang93.com/maven/" + url[libs.Length..]);
         else if (url.StartsWith(meta, StringComparison.OrdinalIgnoreCase))
-            yield return "https://bmclapi2.bangbang93.com/" + url[meta.Length..];
+            list.Add("https://bmclapi2.bangbang93.com/" + url[meta.Length..]);
+
+        // 得分高的源先试（失败的源会被扣分，下一轮自动排到后面）
+        return list.OrderByDescending(u => { _sourceScore.TryGetValue(SourceKey(u), out int sc); return sc; });
     }
 
     private static async Task<string> Sha1Async(string path)
